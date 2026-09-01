@@ -8,6 +8,7 @@ mod api;
 mod config;
 mod domain;
 mod servers;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,7 +67,7 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
         let app = api::router(state);
 
         let listener = tokio::net::TcpListener::bind(&config.listen).await?;
-        tracing::info!("rcmd listening on {}", config.listen);
+        tracing::info!("rcmd listening on http://{}", config.listen);
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;

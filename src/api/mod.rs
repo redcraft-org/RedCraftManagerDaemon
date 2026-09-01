@@ -26,6 +26,9 @@ pub struct AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/", get(crate::web::index))
+        .route("/style.css", get(crate::web::asset))
+        .route("/app.js", get(crate::web::asset))
         .route("/healthz", get(healthz))
         .route("/version", get(version))
         .route("/api/v1/servers", get(list_servers))

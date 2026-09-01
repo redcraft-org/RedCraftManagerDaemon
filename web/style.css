@@ -14,6 +14,14 @@
 
 * { box-sizing: border-box; }
 
+/* The hidden attribute has to beat every display rule below it. The
+   browser's own stylesheet says [hidden] is display:none, but that loses to
+   any author rule setting display, so an element with display:grid on it
+   stays on screen when you hide it. That is exactly what happened to the
+   sign in panel: signing in worked, the app rendered, and it rendered
+   underneath a login box that was still 100vh tall. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);

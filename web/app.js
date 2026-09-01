@@ -74,6 +74,9 @@ function signOut(why) {
 }
 
 async function signIn(candidate) {
+  // Clicking sign in twice used to leave two pollers running, and every
+  // click after that added another one.
+  clearInterval(timer);
   token = candidate;
   me = await api("/api/v1/whoami");
   try {

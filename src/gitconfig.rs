@@ -236,6 +236,68 @@ impl ConfigRepo {
         None
     }
 
+    /// Opens a branch and a pull request for an arbitrary set of edits.
+    ///
+    /// Same machinery as a pin bump, but the caller decides the branch and
+    /// the title, because "somebody asked for this plugin to be added" is
+    /// not an update and should not look like one in the branch list.
+    pub async fn propose(
+        &self,
+        branch_suffix: &str,
+        title: &str,
+        body: &str,
+        edits: &BTreeMap<PathBuf, String>,
+    ) -> Result<Proposal, GitError> {
+        if !self.is_checkout() {
+            return Err(GitError::NotACheckout(self.root.display().to_string()));
+        }
+        let branch = format!("change/{}", slug(branch_suffix));
+
+        self.git(&["fetch", "--prune", "origin"]).await?;
+        self.git(&[
+            "checkout",
+            "-B",
+            &branch,
+            &format!("origin/{}", self.branch),
+        ])
+        .await?;
+        for (relative, contents) in edits {
+            let path = self.root.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| GitError::Io(e.to_string()))?;
+            }
+            std::fs::write(&path, contents).map_err(|e| GitError::Io(e.to_string()))?;
+        }
+        // Add new files too: a catalog entry can bring a template with it.
+        self.git(&["add", "-A"]).await?;
+        let staged = self.git(&["diff", "--cached", "--name-only"]).await?;
+        if staged.trim().is_empty() {
+            self.git(&["checkout", &self.branch]).await.ok();
+            return Ok(Proposal {
+                branch,
+                title: title.to_string(),
+                body: body.to_string(),
+                pushed: false,
+                changed_files: vec![],
+                url: None,
+            });
+        }
+        self.git(&["commit", "-m", title]).await?;
+        self.git(&["push", "--force-with-lease", "origin", &branch])
+            .await?;
+        let changed_files = staged.lines().map(|line| line.to_string()).collect();
+        self.git(&["checkout", &self.branch]).await.ok();
+        let url = self.open_pull_request(&branch, title, body).await;
+        Ok(Proposal {
+            branch,
+            title: title.to_string(),
+            body: body.to_string(),
+            pushed: true,
+            changed_files,
+            url,
+        })
+    }
+
     async fn remote_branch_exists(&self, branch: &str) -> bool {
         self.git(&["rev-parse", "--verify", &format!("origin/{branch}")])
             .await

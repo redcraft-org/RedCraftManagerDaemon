@@ -14,6 +14,7 @@ mod gitconfig;
 mod mcp;
 mod notify;
 mod pipeline;
+mod plugins;
 mod policy;
 mod s3;
 mod scheduler;
@@ -417,7 +418,7 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
             started_at: chrono::Utc::now(),
             frozen_servers: config.frozen_servers.clone(),
             non_minecraft_servers: config.non_minecraft_servers.clone(),
-            player_count_url: config.player_count_url.clone(),
+            plugins: plugins::Plugins::load(&config.plugins),
             push_window: config.push_window.clone(),
             config: tokio::sync::RwLock::new(api::LoadedConfig { catalog, templates }),
             manifest: database.clone(),
@@ -433,6 +434,7 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
             repo: config_repo,
             notifier,
             pipeline_lock: tokio::sync::Mutex::new(()),
+            roster_cache: tokio::sync::RwLock::new(None),
         });
 
         let _schedules = scheduler::spawn_all(state.clone(), &config);

@@ -38,7 +38,7 @@ pub struct AppState {
     /// The parts of the policy situation that come from the config file.
     pub frozen_servers: Vec<String>,
     pub non_minecraft_servers: Vec<String>,
-    pub player_count_url: Option<String>,
+    pub plugins: crate::plugins::Plugins,
     pub push_window: Option<PushWindow>,
     /// The catalog and templates, reloadable without a restart because
     /// they come from a git checkout somebody else may be updating.
@@ -55,6 +55,8 @@ pub struct AppState {
     /// One pipeline at a time. Two runs fetching the same artifacts into
     /// the same store is a race nobody needs to debug.
     pub pipeline_lock: tokio::sync::Mutex<()>,
+    /// The last roster and when it was read.
+    pub roster_cache: tokio::sync::RwLock<Option<(std::time::Instant, crate::plugins::Roster)>>,
 }
 
 pub struct LoadedConfig {
@@ -68,7 +70,7 @@ impl AppState {
         Situation {
             frozen_servers: self.frozen_servers.clone(),
             non_minecraft_servers: self.non_minecraft_servers.clone(),
-            players_online: self.players_online().await,
+            players_online: PlayerCount::Unconfigured,
             push_window_open: self
                 .push_window
                 .as_ref()
@@ -77,37 +79,55 @@ impl AppState {
         }
     }
 
-    /// Asks the configured endpoint how many players are connected.
+    /// Who is on, per server, from whichever plugin reports players.
     ///
-    /// A slow answer is the same as no answer here: the point of the count
-    /// is to decide quickly whether a restart is rude, and a request that
-    /// hangs for thirty seconds has already failed at that.
-    async fn players_online(&self) -> PlayerCount {
-        let Some(url) = self.player_count_url.as_deref() else {
-            return PlayerCount::Unconfigured;
-        };
-        let response = self
-            .resolver
-            .client()
-            .get(url)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await;
-        let body = match response {
-            Ok(response) if response.status().is_success() => response.text().await,
-            Ok(response) => {
-                tracing::warn!("player count endpoint answered {}", response.status());
-                return PlayerCount::Unavailable;
+    /// Cached for a few seconds because the preflight endpoint asks for
+    /// every server on every page refresh, and the proxy does not need to
+    /// answer that eight times a second.
+    pub async fn roster(&self) -> Option<Result<crate::plugins::Roster, String>> {
+        {
+            let cached = self.roster_cache.read().await;
+            if let Some((at, roster)) = cached.as_ref() {
+                if at.elapsed() < std::time::Duration::from_secs(5) {
+                    return Some(Ok(roster.clone()));
+                }
+            }
+        }
+        let answer = self.plugins.roster().await?;
+        match answer {
+            Ok(roster) => {
+                *self.roster_cache.write().await =
+                    Some((std::time::Instant::now(), roster.clone()));
+                Some(Ok(roster))
             }
             Err(e) => {
-                tracing::warn!("could not reach the player count endpoint: {e}");
-                return PlayerCount::Unavailable;
+                tracing::warn!("could not read the player roster: {e}");
+                Some(Err(e.to_string()))
             }
-        };
-        match body.ok().as_deref().and_then(parse_player_count) {
-            Some(count) => PlayerCount::Known(count),
-            None => PlayerCount::Unavailable,
         }
+    }
+
+    /// What the policy layer should think about one server's players.
+    pub async fn players_on(&self, server: &str) -> PlayerCount {
+        match self.roster().await {
+            None => PlayerCount::Unconfigured,
+            Some(Err(_)) => PlayerCount::Unavailable,
+            // A server the roster does not mention is one nothing reports
+            // players for, like the map renderer. That is not the same as a
+            // source being down, so it does not block anything.
+            Some(Ok(roster)) => match roster.get(server) {
+                Some(players) => PlayerCount::Known(players.len() as u32),
+                None => PlayerCount::Unconfigured,
+            },
+        }
+    }
+
+    /// The situation for one particular server, which is the only way the
+    /// player rule can be accurate.
+    pub async fn situation_for(&self, server: &str) -> Situation {
+        let mut situation = self.situation().await;
+        situation.players_online = self.players_on(server).await;
+        situation
     }
 
     /// Decides, writes it down, and gives the caller the reason either way.
@@ -117,7 +137,10 @@ impl AppState {
         action: Action,
         force: bool,
     ) -> Result<(), ApiError> {
-        let situation = self.situation().await;
+        let situation = match action.target() {
+            Some(server) => self.situation_for(&server).await,
+            None => self.situation().await,
+        };
         let verdict = policy::check(actor, &action, &situation, force);
         auth::audit(
             &self.database,
@@ -176,21 +199,6 @@ impl AppState {
         self.notifier.pipeline_finished(&report).await;
         Ok(report)
     }
-}
-
-/// Reads a player count out of whatever the endpoint answered with.
-fn parse_player_count(body: &str) -> Option<u32> {
-    let trimmed = body.trim();
-    if let Ok(count) = trimmed.parse::<u32>() {
-        return Some(count);
-    }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    value
-        .pointer("/players/online")
-        .or_else(|| value.pointer("/online"))
-        .or_else(|| value.pointer("/players"))
-        .and_then(|found| found.as_u64())
-        .map(|count| count as u32)
 }
 
 /// Errors that are not about a server.
@@ -274,6 +282,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/servers/{name}/restart", post(restart_server))
         .route("/api/v1/servers/{name}/command", post(run_command))
         .route("/api/v1/servers/{name}/console", get(console))
+        .route("/api/v1/servers/{name}/log", get(server_log))
+        .route("/api/v1/players", get(players))
         .route("/api/v1/servers/{name}/backup", post(backup))
         .route("/api/v1/artifacts", get(list_artifacts))
         .route(
@@ -845,4 +855,65 @@ async fn upload_version(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(json!({ "stored": outcome })))
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default = "default_log_lines")]
+    lines: u32,
+    /// Literal substring, not a pattern.
+    #[serde(default)]
+    contains: String,
+}
+fn default_log_lines() -> u32 {
+    200
+}
+
+/// The log file, which keeps far more than the console pane does.
+async fn server_log(
+    State(state): State<Arc<AppState>>,
+    Caller(actor): Caller,
+    Path(name): Path<String>,
+    Query(query): Query<LogQuery>,
+) -> Result<Response, ApiError> {
+    require_read(&actor)?;
+    let read = state
+        .manager
+        .log(&name, query.lines, &query.contains)
+        .await?;
+    Ok(Json(json!({
+        // Same fencing as the console: a log is full of things players
+        // typed, and it is not rcmd talking.
+        "untrusted": true,
+        "label": format!("log from {name}"),
+        "origin": read.origin,
+        "path": read.path,
+        "content": read.content,
+    }))
+    .into_response())
+}
+
+async fn players(
+    State(state): State<Arc<AppState>>,
+    Caller(actor): Caller,
+) -> Result<impl IntoResponse, ApiError> {
+    require_read(&actor)?;
+    match state.roster().await {
+        None => Ok(Json(json!({
+            "configured": false,
+            "note": "no plugin reports players, so rcmd does not know",
+        }))),
+        Some(Err(e)) => Err(ApiError::Internal(e)),
+        Some(Ok(roster)) => {
+            let total: usize = roster.values().map(|p| p.len()).sum();
+            Ok(Json(json!({
+                "configured": true,
+                "source": state.plugins.player_source_name(),
+                "online": total,
+                // Player names are chosen by players.
+                "untrusted": true,
+                "servers": roster,
+            })))
+        }
+    }
 }

@@ -17,6 +17,7 @@
 
 pub mod apply;
 pub mod backup;
+pub mod logs;
 pub mod tmux;
 
 use std::collections::HashMap;
@@ -147,6 +148,9 @@ pub struct Manager {
     backup_bucket: Option<Arc<crate::s3::Bucket>>,
     /// Where a crash goes when nobody is looking at the log.
     notifier: Option<Arc<crate::notify::Notifier>>,
+    /// Where to look for a log file, and the per server overrides.
+    log_files: Vec<String>,
+    log_files_by_server: std::collections::BTreeMap<String, Vec<String>>,
     /// Servers the automatic paths must not touch.
     ///
     /// The policy layer already refuses to restart these when a person
@@ -170,6 +174,8 @@ impl Manager {
             backup_bucket: None,
             notifier: None,
             frozen: config.frozen_servers.clone(),
+            log_files: config.log_files.clone(),
+            log_files_by_server: config.log_files_by_server.clone(),
             warn_command: config.warn_command.clone(),
             warn_seconds: config.warn_seconds,
             template_source: config.template_source.clone(),
@@ -685,6 +691,69 @@ impl Manager {
             return Err(ServerError::NotRunning(name.to_string()));
         }
         Ok(self.tmux.capture_pane(name, lines).await?)
+    }
+
+    /// The server's log, from a file when there is one and from the tmux
+    /// pane when there is not.
+    ///
+    /// The pane holds a few hundred lines and forgets the rest, so anything
+    /// that happened more than a little while ago only exists in the file.
+    /// That is the whole reason this is not just `console`.
+    pub async fn log(
+        &self,
+        name: &str,
+        lines: u32,
+        contains: &str,
+    ) -> Result<logs::LogRead, ServerError> {
+        let entry = self.entry(name).await?;
+        let patterns = self
+            .log_files_by_server
+            .get(name)
+            .unwrap_or(&self.log_files)
+            .clone();
+        let dir = entry.dir.clone();
+        let contains = contains.to_string();
+        let lines = lines.clamp(1, 5000) as usize;
+
+        let needle = contains.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            logs::find_log(&dir, &patterns).map(|path| {
+                let content = logs::tail(&path, lines, &needle);
+                (path, content)
+            })
+        })
+        .await
+        .map_err(|e| ServerError::Config(format!("log read panicked: {e}")))?;
+
+        match found {
+            Some((path, Ok(content))) => Ok(logs::LogRead {
+                origin: logs::LogOrigin::File,
+                path: Some(path.display().to_string()),
+                content,
+            }),
+            Some((path, Err(e))) => Err(ServerError::Config(format!(
+                "could not read {}: {e}",
+                path.display()
+            ))),
+            // Nothing on disk matched, so the pane is all there is.
+            None => {
+                let content = self.console(name, lines as u32).await?;
+                let content = if contains.is_empty() {
+                    content
+                } else {
+                    content
+                        .lines()
+                        .filter(|line| line.contains(&contains))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                Ok(logs::LogRead {
+                    origin: logs::LogOrigin::Console,
+                    path: None,
+                    content,
+                })
+            }
+        }
     }
 
     pub async fn backup(&self, name: &str) -> Result<backup::BackupReport, ServerError> {

@@ -61,6 +61,21 @@ pub struct Config {
     /// instead.
     pub pipeline_schedule: String,
 
+    /// Where to look for a server's log, relative to its directory.
+    ///
+    /// Tried in order, first pattern that matches anything wins, and `*` is
+    /// the only wildcard. When several files match one pattern the most
+    /// recently written one is used, which is what you want when something
+    /// rotates its logs.
+    ///
+    /// Nothing matching is fine: rcmd falls back to the tmux pane, which is
+    /// all a non Minecraft process usually has anyway.
+    pub log_files: Vec<String>,
+
+    /// Per server overrides for the above, for the one process that keeps
+    /// its log somewhere nobody would guess.
+    pub log_files_by_server: std::collections::BTreeMap<String, Vec<String>>,
+
     /// Start every stopped server when rcmd starts.
     ///
     /// Off by default, because a tool that starts servers you did not ask
@@ -88,12 +103,11 @@ pub struct Config {
     /// have no template and no players to warn.
     pub non_minecraft_servers: Vec<String>,
 
-    /// Where to ask how many players are connected, so a restart can refuse
-    /// to drop them. Leave it unset and rcmd will not ask.
+    /// Plugins, the things that tell rcmd about the rest of your setup.
     ///
-    /// Anything that answers with a bare number, or with JSON containing
-    /// `players.online` or `online`, works.
-    pub player_count_url: Option<String>,
+    /// Configure one that reports players and a restart will refuse to drop
+    /// them. Without one rcmd does not ask, and does not pretend to know.
+    pub plugins: Vec<crate::plugins::PluginConfig>,
 
     /// What to send to a server before restarting it, and how long to wait
     /// afterwards. `{minutes}` and `{reason}` are filled in.
@@ -187,12 +201,14 @@ impl Default for Config {
             artifact_directory: PathBuf::from("/var/lib/rcmd/artifacts"),
             build_directory: PathBuf::from("/var/lib/rcmd/builds"),
             pipeline_schedule: "0 3 * * *".into(),
+            log_files: vec!["logs/latest.log".into(), "logs/*.log".into()],
+            log_files_by_server: Default::default(),
             auto_start_on_boot: false,
             backup_schedule: String::new(),
             restart_schedule: String::new(),
             frozen_servers: vec![],
             non_minecraft_servers: vec![],
-            player_count_url: None,
+            plugins: vec![],
             warn_command: "say Restarting in {minutes} minute(s): {reason}".into(),
             warn_seconds: 0,
             push_window: None,

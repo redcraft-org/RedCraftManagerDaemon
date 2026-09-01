@@ -104,7 +104,7 @@ pub struct Situation {
     /// Servers that are not Minecraft. A template restart on the map
     /// renderer is not a thing that means anything.
     pub non_minecraft_servers: Vec<String>,
-    /// How many players are connected.
+    /// Who is connected, per server.
     pub players_online: PlayerCount,
     /// Whether pushing to public repositories is allowed right now.
     pub push_window_open: bool,
@@ -118,11 +118,12 @@ pub struct Situation {
 /// not find out, and only the second one is a reason to refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlayerCount {
-    /// No source of player counts is set up.
+    /// No plugin reports players.
     #[default]
     Unconfigured,
+    /// This many are on the server in question.
     Known(u32),
-    /// A source is set up and it did not answer.
+    /// A plugin is configured and it did not answer.
     Unavailable,
 }
 

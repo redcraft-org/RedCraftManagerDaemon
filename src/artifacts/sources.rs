@@ -45,12 +45,6 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    /// The shared HTTP client, so callers outside this module do not spin up
-    /// a second connection pool for one request.
-    pub fn client(&self) -> &reqwest::Client {
-        &self.client
-    }
-
     pub fn new(github_token: Option<String>) -> Self {
         Self {
             client: reqwest::Client::builder()

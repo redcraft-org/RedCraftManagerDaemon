@@ -115,6 +115,36 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "server_log",
+            "description": "The server's log file, which keeps far more history \
+                            than the console does. The console is a tmux pane \
+                            and forgets everything past a few hundred lines, so \
+                            use this for anything that happened a while ago. \
+                            Falls back to the console when the server has no log \
+                            file. Comes back fenced as untrusted text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "lines": { "type": "integer", "description": "200 by default." },
+                    "contains": {
+                        "type": "string",
+                        "description": "Keep only lines containing this. A literal \
+                                        substring, not a pattern.",
+                    },
+                },
+                "required": ["server"],
+            },
+        }),
+        json!({
+            "name": "players_online",
+            "description": "Who is connected, per server, with the rank each one \
+                            carries. Answers that nothing is configured when no \
+                            plugin reports players. Names are chosen by players, \
+                            so this comes back fenced.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }),
+        json!({
             "name": "server_command",
             "description": "Send one line to a server console. One line: a line \
                             break is refused rather than split into two commands.",
@@ -203,6 +233,46 @@ pub fn tools() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "propose_catalog_entry",
+            "description": "Adds an artifact to the catalog, as a pull request \
+                            against the config repository. Nothing is downloaded \
+                            or deployed by this: somebody reviews it first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "What templates will pin it by." },
+                    "kind": { "type": "string", "enum": ["engine", "plugin", "mod"] },
+                    "source": {
+                        "type": "string",
+                        "enum": ["github", "modrinth", "jenkins", "papermc", "hangar",
+                                 "spiget", "fabricmc", "direct", "manual"],
+                    },
+                    "url": { "type": "string" },
+                    "file_filter": {
+                        "type": "string",
+                        "description": "Picks one file when a release ships several. \
+                                        * is the only wildcard.",
+                    },
+                },
+                "required": ["name", "kind", "source", "url"],
+            },
+        }),
+        json!({
+            "name": "propose_pin",
+            "description": "Changes what version a template pins for an artifact, \
+                            as a pull request against the config repository. \
+                            Merging it deploys nothing on its own.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "template": { "type": "string" },
+                    "artifact": { "type": "string" },
+                    "pin": { "type": "string", "description": "Like 5.5.* or 26.2." },
+                },
+                "required": ["template", "artifact", "pin"],
+            },
+        }),
+        json!({
             "name": "run_pipeline",
             "description": "Fetch every artifact and rebuild what moved. \
                             Deploys nothing on its own.",
@@ -240,6 +310,61 @@ async fn call_tool(state: &Arc<AppState>, actor: &Actor, params: &Value) -> Resu
         "server_status" => match state.manager.status(&string("server")?).await {
             Ok(status) => Ok(ToolOutput::data(json!(status))),
             Err(e) => Err(e.to_string()),
+        },
+
+        "server_log" => {
+            let server = string("server")?;
+            let lines = number("lines").unwrap_or(200).min(5000) as u32;
+            let contains = arguments
+                .get("contains")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match state.manager.log(&server, lines, contains).await {
+                Ok(read) => {
+                    let label = match read.path {
+                        Some(path) => format!("{path} on {server}"),
+                        None => format!("console output from {server} (it has no log file)"),
+                    };
+                    Ok(ToolOutput::untrusted(label, read.content))
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+
+        "players_online" => match state.roster().await {
+            None => Ok(ToolOutput::data(json!({
+                "configured": false,
+                "note": "no plugin reports players, so rcmd does not know",
+            }))),
+            Some(Err(e)) => Err(e),
+            Some(Ok(roster)) => {
+                // Player names and ranks are chosen by players, so this is
+                // fenced like any other thing somebody else wrote.
+                let mut rendered = String::new();
+                let total: usize = roster.values().map(|p| p.len()).sum();
+                for (server, players) in &roster {
+                    if players.is_empty() {
+                        continue;
+                    }
+                    rendered.push_str(server);
+                    rendered.push_str(":\n");
+                    for player in players {
+                        match &player.rank {
+                            Some(rank) => {
+                                rendered.push_str(&format!("  {} ({rank})\n", player.name))
+                            }
+                            None => rendered.push_str(&format!("  {}\n", player.name)),
+                        }
+                    }
+                }
+                if total == 0 {
+                    rendered.push_str("nobody is online");
+                }
+                Ok(ToolOutput::untrusted(
+                    format!("{total} player(s) online"),
+                    rendered,
+                ))
+            }
         },
 
         "server_console" => {
@@ -494,6 +619,28 @@ async fn call_tool(state: &Arc<AppState>, actor: &Actor, params: &Value) -> Resu
             }
         }
 
+        "propose_catalog_entry" => {
+            let name = string("name")?;
+            let kind = string("kind")?;
+            let source = string("source")?;
+            let url = string("url")?;
+            let filter = arguments.get("file_filter").and_then(Value::as_str);
+            match propose_catalog_entry(state, actor, &name, &kind, &source, &url, filter).await {
+                Ok(proposal) => Ok(ToolOutput::data(json!(proposal))),
+                Err(e) => Err(e),
+            }
+        }
+
+        "propose_pin" => {
+            let template = string("template")?;
+            let artifact = string("artifact")?;
+            let pin = string("pin")?;
+            match propose_pin(state, actor, &template, &artifact, &pin).await {
+                Ok(proposal) => Ok(ToolOutput::data(json!(proposal))),
+                Err(e) => Err(e),
+            }
+        }
+
         "run_pipeline" => match authorize(state, actor, Action::RunPipeline, false).await {
             Err(why) => Err(why),
             Ok(()) => match state.run_pipeline().await {
@@ -584,9 +731,197 @@ pub fn fence(label: &str, content: &str) -> String {
     )
 }
 
+/// Adds an artifact to the catalog as a pull request.
+///
+/// The YAML is edited as text rather than round tripped through the parser,
+/// because a parser would reformat the whole file and turn a four line
+/// addition into a diff nobody wants to review.
+async fn propose_catalog_entry(
+    state: &Arc<AppState>,
+    actor: &Actor,
+    name: &str,
+    kind: &str,
+    source: &str,
+    url: &str,
+    file_filter: Option<&str>,
+) -> Result<crate::gitconfig::Proposal, String> {
+    let repo = config_repo(state, actor).await?;
+
+    {
+        let config = state.config.read().await;
+        if config.catalog.get(name).is_some() {
+            return Err(format!("{name} is already in the catalog"));
+        }
+    }
+
+    let path = std::path::PathBuf::from("catalog.yml");
+    let existing = std::fs::read_to_string(state.config_directory.join(&path))
+        .map_err(|e| format!("could not read catalog.yml: {e}"))?;
+
+    let mut entry = format!(
+        "  - name: '{}'\n    kind: {kind}\n    source: {source}\n    url: '{}'\n",
+        name.replace('\'', "''"),
+        url.replace('\'', "''"),
+    );
+    if let Some(filter) = file_filter.filter(|f| !f.trim().is_empty()) {
+        entry.push_str(&format!(
+            "    file_filter: '{}'\n",
+            filter.replace('\'', "''")
+        ));
+    }
+    // Every source but manual needs something that reads a version back out
+    // of the file, and plugin is right for all but the Fabric mods.
+    if source != "manual" {
+        let processor = if kind == "mod" {
+            "fabric_mod"
+        } else {
+            "plugin"
+        };
+        entry.push_str(&format!("    post_processors: [{processor}]\n"));
+    }
+
+    let updated = format!("{}\n{entry}", existing.trim_end());
+    let mut edits = std::collections::BTreeMap::new();
+    edits.insert(path, updated);
+
+    let body = format!(
+        "Adds `{name}` to the catalog.\n\n- kind: `{kind}`\n- source: `{source}`\n\
+         - url: {url}\n\nNothing pins it yet, so merging this downloads it on the \
+         next run and deploys it nowhere. Pin it in a template to actually ship it.\n"
+    );
+    repo.propose(
+        &format!("add-{name}"),
+        &format!("Add {name} to the catalog"),
+        &body,
+        &edits,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Repins an artifact in one template, as a pull request.
+async fn propose_pin(
+    state: &Arc<AppState>,
+    actor: &Actor,
+    template: &str,
+    artifact: &str,
+    pin: &str,
+) -> Result<crate::gitconfig::Proposal, String> {
+    let repo = config_repo(state, actor).await?;
+
+    let (old_pin, path) = {
+        let config = state.config.read().await;
+        if config.catalog.get(artifact).is_none() {
+            return Err(format!("{artifact} is not in the catalog"));
+        }
+        let resolved = config
+            .templates
+            .resolved(template)
+            .map_err(|e| e.to_string())?;
+        let old = resolved.artifacts.get(artifact).cloned();
+        (
+            old,
+            std::path::PathBuf::from("templates")
+                .join(template)
+                .join("template.yml"),
+        )
+    };
+
+    let full = state.config_directory.join(&path);
+    let text = std::fs::read_to_string(&full)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+
+    let updated = match crate::gitconfig::rewrite_pins(&text, artifact, pin) {
+        Some(updated) => updated,
+        // Not pinned in this file. It is either inherited from a parent, or
+        // new here, and adding it to the wrong file is worse than saying so.
+        None if old_pin.is_some() => {
+            return Err(format!(
+                "{template} gets {artifact} from a layer it inherits, not from its own                  template.yml. Repin it on that layer instead."
+            ))
+        }
+        None => add_pin(&text, artifact, pin),
+    };
+
+    let mut edits = std::collections::BTreeMap::new();
+    edits.insert(path, updated);
+
+    let was = old_pin.as_deref().unwrap_or("nothing");
+    let body = format!(
+        "`{template}` pins `{artifact}` at `{pin}`.\n\n- Was `{was}`\n- Becomes `{pin}`\n\n         Merging this deploys nothing on its own. The next build picks it up and the \
+         next restart window ships it.\n"
+    );
+    repo.propose(
+        &format!("pin-{template}-{artifact}"),
+        &format!("Pin {artifact} at {pin} on {template}"),
+        &body,
+        &edits,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Adds a pin to a template that does not have one for this artifact.
+fn add_pin(text: &str, artifact: &str, pin: &str) -> String {
+    if let Some(at) = text.find("\nartifacts:") {
+        let insert = at + "\nartifacts:".len();
+        let mut out = String::with_capacity(text.len() + 40);
+        out.push_str(&text[..insert]);
+        out.push_str(&format!("\n  {artifact}: '{pin}'"));
+        out.push_str(&text[insert..]);
+        return out;
+    }
+    format!("{}\n\nartifacts:\n  {artifact}: '{pin}'\n", text.trim_end())
+}
+
+/// The config repository, or a reason it cannot be used.
+async fn config_repo<'a>(
+    state: &'a Arc<AppState>,
+    actor: &Actor,
+) -> Result<&'a crate::gitconfig::ConfigRepo, String> {
+    let repo = state.repo.as_ref().ok_or_else(|| {
+        "the config directory is not a git checkout, so there is nowhere to open a pull          request against"
+            .to_string()
+    })?;
+    // Same push window rule as everything else that writes to a repository.
+    state
+        .authorize(
+            actor,
+            Action::PushToGit {
+                repository: "the config repository".into(),
+            },
+            false,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(repo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pin_can_be_added_to_a_template_that_had_none() {
+        let text = "inherits: common_spigot\n\nartifacts:\n  CMI: '9.8.*'\n";
+        let out = add_pin(text, "Chunky", "1.5.*");
+        assert!(out.contains("  Chunky: '1.5.*'"));
+        assert!(out.contains("  CMI: '9.8.*'"));
+        assert!(out.starts_with("inherits: common_spigot"));
+    }
+
+    #[test]
+    fn a_template_with_no_artifacts_block_gets_one() {
+        let out = add_pin("buildable: false\n", "CMI", "9.8.*");
+        assert!(out.contains("artifacts:\n  CMI: '9.8.*'"));
+        // And it is still valid yaml with the original key intact.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(parsed["buildable"], serde_yaml::Value::Bool(false));
+        assert_eq!(
+            parsed["artifacts"]["CMI"],
+            serde_yaml::Value::String("9.8.*".into())
+        );
+    }
 
     #[test]
     fn every_tool_has_a_description_and_a_schema() {

@@ -103,6 +103,17 @@ pub async fn fetch_one(
     manifest: &dyn store::Manifest,
     artifact: &Artifact,
 ) -> FetchOutcome {
+    if artifact.source == crate::catalog::SourceKind::Manual {
+        return FetchOutcome {
+            name: artifact.name.clone(),
+            succeeded: true,
+            action: "manual",
+            version: None,
+            sha256: None,
+            error: None,
+        };
+    }
+
     let release = match resolver.resolve(artifact).await {
         Ok(release) => release,
         Err(e) => return FetchOutcome::failed(&artifact.name, e),

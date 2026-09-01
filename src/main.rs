@@ -43,6 +43,14 @@ enum CliCommand {
     Serve,
     /// Interactive first-run setup: writes config.toml.
     Init,
+    /// Check a config directory without running anything.
+    ///
+    /// This is what the config repository's own CI runs on a pull request,
+    /// so a broken pin gets caught by a robot rather than at 3am.
+    Validate {
+        /// The directory to check. Defaults to the configured one.
+        directory: Option<PathBuf>,
+    },
     /// Mint an API token and print it once.
     Token {
         /// What to call it, so you can tell your tokens apart later.
@@ -65,8 +73,102 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(CliCommand::Serve) {
         CliCommand::Serve => serve(&cli.config),
         CliCommand::Init => init(&cli.config),
+        CliCommand::Validate { directory } => validate(&cli.config, directory),
         CliCommand::Token { name, role } => mint_token(&cli.config, &name, &role),
     }
+}
+
+fn validate(config_path: &std::path::Path, directory: Option<PathBuf>) -> anyhow::Result<()> {
+    let root = match directory {
+        Some(directory) => directory,
+        None => config::Config::load_or_default(config_path)?.config_directory,
+    };
+    println!("Checking {}", root.display());
+
+    let (catalog, templates) = pipeline::load_config(&root)?;
+    println!("  {} artifacts", catalog.artifacts.len());
+    println!("  {} templates", templates.by_name.len());
+
+    // The check that matters: a template pinning something the catalog does
+    // not have builds fine right up until the moment it does not.
+    let mut problems = Vec::new();
+    for name in templates.by_name.keys() {
+        let resolved = match templates.resolved(name) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                problems.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
+        for artifact in resolved.artifacts.keys() {
+            if catalog.get(artifact).is_none() {
+                problems.push(format!(
+                    "{name} pins {artifact:?}, which is not in the catalog"
+                ));
+            }
+        }
+        if resolved.buildable && resolved.artifacts.is_empty() {
+            problems.push(format!("{name} is buildable but pins nothing at all"));
+        }
+    }
+
+    // A secret that no config file mentions is a placeholder somebody
+    // renamed in one place and not the other, and it substitutes to nothing
+    // in silence.
+    //
+    // The search covers the whole inheritance chain, in both directions: a
+    // base layer commonly declares a placeholder its children's files use,
+    // and a child commonly declares one that only appears in the parent's.
+    // Only buildable templates are checked, because a layer on its own is
+    // not supposed to be complete.
+    for name in templates.by_name.keys() {
+        let (Ok(resolved), Ok(chain)) = (templates.resolved(name), templates.chain(name)) else {
+            continue;
+        };
+        if !resolved.buildable {
+            continue;
+        }
+        for placeholder in resolved.secrets.keys() {
+            let found = chain
+                .iter()
+                .any(|layer| mentions(&layer.directory.join("config"), placeholder));
+            if !found {
+                problems.push(format!(
+                    "{name} substitutes {placeholder:?}, which appears in none of its config files"
+                ));
+            }
+        }
+    }
+
+    if problems.is_empty() {
+        println!("Everything checks out.");
+        return Ok(());
+    }
+    for problem in &problems {
+        eprintln!("  {problem}");
+    }
+    anyhow::bail!("{} problem(s)", problems.len())
+}
+
+/// Whether any config file under a directory contains a string.
+fn mentions(directory: &std::path::Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if mentions(&path, needle) {
+                return true;
+            }
+        } else if std::fs::read_to_string(&path)
+            .map(|text| text.contains(needle))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn mint_token(config_path: &std::path::Path, name: &str, role: &str) -> anyhow::Result<()> {

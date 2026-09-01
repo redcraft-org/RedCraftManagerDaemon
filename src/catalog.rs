@@ -71,6 +71,17 @@ pub enum SourceKind {
     Direct,
     /// The Spiget API, which is SpigotMC without the browser challenge.
     Spiget,
+    /// The Fabric meta API, which needs a loader version and an installer
+    /// version put together before there is a URL to fetch.
+    Fabricmc,
+    /// Nothing to fetch: somebody uploads this one.
+    ///
+    /// A handful of plugins sit behind a login and a bot check. Pretending
+    /// rcmd can download them means a failed job every single night, which
+    /// is how a report full of red stops being read. Saying so instead
+    /// leaves the run clean and the jar arrives through the upload
+    /// endpoint.
+    Manual,
 }
 
 /// What to do with the file once it is downloaded. The important job is

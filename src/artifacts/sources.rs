@@ -68,6 +68,11 @@ impl Resolver {
             SourceKind::Jenkins => self.jenkins(artifact).await,
             SourceKind::Papermc => self.papermc(artifact).await,
             SourceKind::Spiget => self.spiget(artifact).await,
+            SourceKind::Fabricmc => self.fabricmc(artifact).await,
+            SourceKind::Manual => Err(SourceError::NoMatch {
+                from: "manual",
+                filter: artifact.name.clone(),
+            }),
             // A URL that always points at the latest build. There is
             // nothing to resolve, and no way to know the version without
             // downloading it.
@@ -305,6 +310,47 @@ impl Resolver {
             upstream_id: version.name.or_else(|| version.id.map(|i| i.to_string())),
         })
     }
+
+    /// The Fabric server jar, which nobody serves as one URL.
+    ///
+    /// The meta API answers with a list of loader versions for a Minecraft
+    /// version and a separate list of installer versions, and the download
+    /// path is built out of both. The catalog url points at the loader
+    /// listing for the Minecraft version you want.
+    async fn fabricmc(&self, artifact: &Artifact) -> Result<Release, SourceError> {
+        #[derive(Deserialize)]
+        struct Loader {
+            version: String,
+        }
+        #[derive(Deserialize)]
+        struct LoaderEntry {
+            loader: Loader,
+        }
+        #[derive(Deserialize)]
+        struct Installer {
+            version: String,
+        }
+
+        let loaders: Vec<LoaderEntry> = self.get_json("fabricmc", &artifact.url).await?;
+        let loader = loaders.first().ok_or_else(|| SourceError::NoMatch {
+            from: "fabricmc",
+            filter: "any loader version".into(),
+        })?;
+        let installers: Vec<Installer> = self.get_json("fabricmc", FABRIC_INSTALLERS).await?;
+        let installer = installers.first().ok_or_else(|| SourceError::NoMatch {
+            from: "fabricmc",
+            filter: "any installer version".into(),
+        })?;
+
+        let base = artifact.url.trim_end_matches('/');
+        Ok(Release {
+            url: format!(
+                "{base}/{}/{}/server/jar",
+                loader.loader.version, installer.version
+            ),
+            upstream_id: Some(loader.loader.version.clone()),
+        })
+    }
 }
 
 /// `https://github.com/owner/repo` or any deeper url gives `owner/repo`.
@@ -333,6 +379,9 @@ fn modrinth_slug(url: &str) -> Option<String> {
 
 /// SpigotMC resource urls end in `.<id>/`, for example
 /// `https://www.spigotmc.org/resources/plotsquared.77506/`.
+/// The Fabric meta API's installer listing.
+const FABRIC_INSTALLERS: &str = "https://meta.fabricmc.net/v2/versions/installer";
+
 fn spiget_id(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
     let last = trimmed.rsplit('/').next()?;

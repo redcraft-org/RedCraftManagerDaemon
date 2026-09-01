@@ -61,6 +61,17 @@ pub struct Config {
     /// instead.
     pub pipeline_schedule: String,
 
+    /// Start every stopped server when rcmd starts.
+    ///
+    /// Off by default, because a tool that starts servers you did not ask
+    /// it to start is a surprise. Turn it on and a reboot of the box brings
+    /// the fleet back on its own.
+    ///
+    /// Please notice that a server left down as a bootloop stays down: it
+    /// is started once here, and if it dies again the usual crash counting
+    /// takes over.
+    pub auto_start_on_boot: bool,
+
     /// When to back every server up. Empty disables it.
     pub backup_schedule: String,
 
@@ -176,6 +187,7 @@ impl Default for Config {
             artifact_directory: PathBuf::from("/var/lib/rcmd/artifacts"),
             build_directory: PathBuf::from("/var/lib/rcmd/builds"),
             pipeline_schedule: "0 3 * * *".into(),
+            auto_start_on_boot: false,
             backup_schedule: String::new(),
             restart_schedule: String::new(),
             frozen_servers: vec![],

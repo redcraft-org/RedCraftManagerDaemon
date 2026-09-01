@@ -532,6 +532,47 @@ impl Manager {
         Ok(minutes)
     }
 
+    /// Starts everything that is not already running.
+    ///
+    /// Only ever called at startup, and only when the config asks for it.
+    /// A server that is already up is left alone rather than restarted,
+    /// which is the difference between this and a fleet restart.
+    pub async fn start_all_stopped(&self) -> FleetReport {
+        let names: Vec<String> = self.servers.read().await.keys().cloned().collect();
+        let mut report = FleetReport::default();
+        for name in names {
+            if self.frozen.contains(&name) {
+                report.skipped.push(name);
+                continue;
+            }
+            match self.tmux.session_exists(&name).await {
+                Ok(true) => continue,
+                // Same rule as discovery: a question tmux could not answer
+                // is not a server that is down.
+                Err(e) => {
+                    tracing::error!("not starting {name}, tmux did not answer: {e}");
+                    report.failed.push(format!("{name}: {e}"));
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            match self.start(&name).await {
+                Ok(()) => report.restarted.push(name),
+                Err(e) => {
+                    tracing::error!("could not start {name}: {e}");
+                    report.failed.push(format!("{name}: {e}"));
+                }
+            }
+        }
+        tracing::info!(
+            "auto start done: {} started, {} failed, {} skipped",
+            report.restarted.len(),
+            report.failed.len(),
+            report.skipped.len()
+        );
+        report
+    }
+
     /// Warns the whole fleet once, waits once, then restarts it.
     ///
     /// The warning goes to every server first and the wait happens once,

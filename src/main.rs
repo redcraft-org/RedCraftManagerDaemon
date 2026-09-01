@@ -209,6 +209,12 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
             discovered.join(", ")
         );
 
+        if config.auto_start_on_boot {
+            // Before the healthcheck, so a server that takes a while to
+            // come up is not immediately counted as a crash.
+            manager.start_all_stopped().await;
+        }
+
         let _health = manager.spawn_healthcheck();
 
         let database = Arc::new(store::Database::connect(&config.database_url).await?);

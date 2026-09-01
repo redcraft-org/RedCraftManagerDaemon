@@ -10,6 +10,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Built inside Debian stable on purpose. A binary linked against the
+    # runner's much newer glibc refuses to start on anything older, which
+    # is most of the machines anybody actually runs a Minecraft server on.
+    container: rust:1-bookworm
     steps:
       - uses: actions/checkout@v5
 
@@ -18,12 +22,21 @@ jobs:
 
       - name: Check the tag matches Cargo.toml
         run: |
-          crate=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           tag="${GITHUB_REF_NAME#v}"
           if [ "$crate" != "$tag" ]; then
             echo "the tag says $tag and Cargo.toml says $crate"
             exit 1
           fi
+
+      - name: Check it will run on an older glibc
+        run: |
+          needs=$(objdump -T target/release/rcmd | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+          echo "needs at most $needs"
+          case "$needs" in
+            GLIBC_2.3[0-9]|GLIBC_2.2*|GLIBC_2.1*) ;;
+            *) echo "that is newer than Debian 12 ships"; exit 1 ;;
+          esac
 
       - name: Publish
         uses: softprops/action-gh-release@v2

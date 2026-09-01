@@ -11,6 +11,7 @@ mod catalog;
 mod config;
 mod domain;
 mod gitconfig;
+mod install;
 mod mcp;
 mod notify;
 mod pipeline;
@@ -53,6 +54,34 @@ enum CliCommand {
         /// The directory to check. Defaults to the configured one.
         directory: Option<PathBuf>,
     },
+    /// Install the systemd service and put the binary in place.
+    ///
+    /// The binary is its own installer, so getting rcmd running is
+    /// downloading one file and running this once.
+    Install {
+        /// Who the service runs as. Defaults to whoever owns the servers
+        /// directory, which is the user whose tmux sessions the servers are
+        /// in. Running as anybody else means rcmd cannot see them.
+        #[arg(long)]
+        user: Option<String>,
+        /// Where the binary should live.
+        #[arg(long, default_value = "/usr/local/bin/rcmd")]
+        binary: PathBuf,
+        /// Enable and start it straight away.
+        #[arg(long)]
+        start: bool,
+    },
+    /// Stop the service and remove the unit.
+    ///
+    /// Your servers keep running: they are in tmux, not in the service.
+    Uninstall {
+        /// Also delete /etc/rcmd, /var/lib/rcmd and the binary.
+        #[arg(long)]
+        purge: bool,
+        /// Where the binary lives, for --purge.
+        #[arg(long, default_value = "/usr/local/bin/rcmd")]
+        binary: PathBuf,
+    },
     /// Check that rcmd can reach everything it is configured to use.
     ///
     /// Read only. Worth running before you point it at a live fleet,
@@ -82,6 +111,21 @@ fn main() -> anyhow::Result<()> {
         CliCommand::Serve => serve(&cli.config),
         CliCommand::Init => init(&cli.config),
         CliCommand::Validate { directory } => validate(&cli.config, directory),
+        CliCommand::Install {
+            user,
+            binary,
+            start,
+        } => {
+            // Only the servers directory is needed, and a missing config is
+            // the normal first run, so defaults are fine here.
+            let servers = config::Config::load_or_default(&cli.config)
+                .map(|c| c.servers_directory)
+                .unwrap_or_else(|_| PathBuf::from("/mnt/minecraft/servers"));
+            install::install(&cli.config, &servers, user, &binary, start).map_err(Into::into)
+        }
+        CliCommand::Uninstall { purge, binary } => {
+            install::uninstall(purge, &binary).map_err(Into::into)
+        }
         CliCommand::Doctor => doctor(&cli.config),
         CliCommand::Token { name, role } => mint_token(&cli.config, &name, &role),
     }

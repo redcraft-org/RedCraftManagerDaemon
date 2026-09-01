@@ -26,6 +26,16 @@ rcmd is meant to be easy on a single server and configurable on a big one. Every
 - Run `./rcmd init` to write a `config.toml`
 - Start it with `./rcmd --config config.toml serve`
 
+### As a service
+
+There's a unit file in `packaging/rcmd.service`, and the release ships it too:
+
+- Put the binary at `/usr/local/bin/rcmd` and the unit at `/etc/systemd/system/rcmd.service`
+- Write your config to `/etc/rcmd/config.toml`, and any secrets to `/etc/rcmd/env` as `NAME=value` lines
+- `systemctl enable --now rcmd`
+
+Please notice that stopping rcmd doesn't stop a single server. They're in their own tmux sessions, and rcmd adopts them again when it comes back, so you can upgrade it in the middle of the afternoon.
+
 On the first run rcmd finds no tokens and mints an admin one, printing it to the log exactly once. Copy it, that's your login. You can make more later with `./rcmd token <name> --role operator`.
 
 The web interface is on `http://127.0.0.1:8484` by default. Paste the token and you're in.
@@ -87,7 +97,9 @@ A template pins an artifact to something like `5.5.*`. `*` is the only wildcard 
 
 "Newest" means the most recently fetched version that matches, not the highest number. Version strings across sixty plugins don't share a scheme, and comparing `1.21.4-SNAPSHOT-b31` against `26.2` is not something a sort order can do honestly.
 
-Versions are read out of the jar, from `plugin.yml`, `bungee.yml`, `paper-plugin.yml`, `velocity-plugin.json`, `fabric.mod.json`, `version.json` or `install.properties` depending on what the thing is. Never from the file name, because a plugin with a dash in its name is not a version.
+Versions are read out of the jar, from `plugin.yml`, `bungee.yml`, `paper-plugin.yml`, `velocity-plugin.json`, `fabric.mod.json`, `version.json` or `install.properties` depending on what the thing is. Never from the file name, because a plugin with a dash in its name is not a version (ask Multiverse-Core, which spent months at version "Core").
+
+A couple of things carry no version anywhere inside the file. Those get `from_source` in their `post_processors`, which takes whatever the source called the release. It's not as good as reading it out of the jar, but it beats guessing.
 
 ### The pipeline
 
@@ -181,6 +193,16 @@ The tools are thin wrappers around the API, so an assistant gets refused for exa
 That last one is worth having. A secret that substitutes to nothing looks exactly like an empty password, and you find out at boot.
 
 Please notice that the config repository can run this in its own CI, so a broken pin gets caught by a robot on a pull request rather than at 3am by you.
+
+## What a template apply will and will not touch
+
+Some files come back different after a server has been running, and that's normal:
+
+- Paper, Purpur and Spigot rewrite `bukkit.yml`, `spigot.yml`, `purpur.yml`, `pufferfish.yml`, `server.properties` and `config/paper-global.yml` at boot, filling in defaults and a version marker
+- Plugins do the same to their own config, LuckPerms and FastAsyncWorldEdit among them
+- CMI reads `portals.yml`, `kits.yml` and `dataBaseInfo.yml` at boot and then DELETES them, which makes them look unused right up until you remove one from the template and the portals stop working (yes, that happened)
+
+:warning: A file that isn't on the server doesn't mean the template doesn't need it. Check what the plugin does with it before taking it out.
 
 ## Contributing
 

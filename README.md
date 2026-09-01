@@ -99,6 +99,30 @@ Ours is at [rcmd_config](https://github.com/redcraft-org/rcmd_config) if you wan
 
 The database holds what happened, not what should happen: which versions were fetched, what a build resolved them to, who did what, and which tokens exist.
 
+#### Letting rcmd write back
+
+Reading needs nothing. The checkout is fetched and hard reset over https, and for a public repository that works with no credential at all.
+
+Writing needs a token, and it's only used for two things: pushing an `update/...` branch and opening the pull request for it. Without one, rcmd still fetches, builds and deploys, it just can't propose. You'll see `could not propose <artifact> <version>` in the log and no pull request.
+
+Make a fine-grained token on GitHub, under Settings, Developer settings, Personal access tokens, Fine-grained tokens:
+
+- Repository access: only select repositories, and pick your config repository. Nothing else
+- Contents: read and write. This is what pushes the branch
+- Pull requests: read and write. This is what opens the pull request
+- Metadata: read-only. GitHub adds this on its own and won't let you remove it
+- Set an expiry you'll actually remember to rotate
+
+That's the whole list. It doesn't need Actions, Workflows, Administration or anything else.
+
+Then put it in `/etc/rcmd/env`:
+
+`RCMD_CONFIG_TOKEN=github_pat_...`
+
+:warning: Put it in `RCMD_CONFIG_TOKEN`, NOT in `GITHUB_TOKEN`. They're different on purpose. `GITHUB_TOKEN` is also sent to every repository your catalog fetches from, so a token scoped to just your config repository would be refused by all of them, and turning on pull requests would silently break every plugin download. `GITHUB_TOKEN` is optional and only exists to lift GitHub's rate limit when you're fetching a lot of releases; if you set both, use a token with public read for that one.
+
+Please notice that rcmd never edits anything under `.github/`, so the token doesn't need the Workflows permission. If you ever ask it to propose a change to a workflow file, GitHub will refuse the push and tell you exactly that.
+
 ### Pins and versions
 
 A template pins an artifact to something like `5.5.*`. `*` is the only wildcard and it matches at least one character, so a dot is a dot.

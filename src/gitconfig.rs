@@ -29,13 +29,31 @@ pub enum GitError {
     Io(String),
 }
 
+/// The environment variable the credential helper reads the token from.
+const TOKEN_VARIABLE: &str = "RCMD_GIT_TOKEN";
+
+/// A git credential helper that answers from the environment.
+///
+/// `x-access-token` is the username GitHub expects when the password is a
+/// token, and it works for both classic and fine grained ones.
+const CREDENTIAL_HELPER: &str = concat!(
+    "credential.helper=!f() { echo username=x-access-token; ",
+    "echo \"password=$RCMD_GIT_TOKEN\"; }; f"
+);
+
 /// A checkout of the config repository.
 pub struct ConfigRepo {
     root: PathBuf,
     /// The branch the daemon follows. Never committed to locally.
     branch: String,
-    /// Used to open the pull request once the branch is pushed. Without
-    /// one the branch still lands, somebody just has to click the button.
+    /// Used to open the pull request once the branch is pushed, and to
+    /// push over https. Without one the branch does not land at all.
+    ///
+    /// Deliberately its own token rather than the one the artifact
+    /// resolver uses. That one is sent to every repository a catalog entry
+    /// points at, and a token scoped to just the config repository would be
+    /// refused by all of them, so sharing one would mean turning on pull
+    /// requests silently broke plugin downloads.
     github_token: Option<String>,
     /// Who the pin bump commits are from. A daemon cannot rely on whatever
     /// happens to be in somebody's global git config, and on a fresh box
@@ -305,11 +323,29 @@ impl ConfigRepo {
     }
 
     async fn git(&self, args: &[&str]) -> Result<String, GitError> {
-        let output = tokio::process::Command::new("git")
+        let mut command = tokio::process::Command::new("git");
+        if self.github_token.is_some() {
+            // Authenticate over https without ever putting the token in the
+            // process arguments, where anybody running ps could read it. The
+            // helper reads it from the environment instead, which is only
+            // readable by the user running the process. The empty helper
+            // first clears whatever is configured globally, so ours is the
+            // only one asked.
+            command
+                .arg("-c")
+                .arg("credential.helper=")
+                .arg("-c")
+                .arg(CREDENTIAL_HELPER);
+        }
+        let output = command
             .args(args)
             .current_dir(&self.root)
             // A prompt for a password in a daemon is a hang, not a prompt.
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env(
+                TOKEN_VARIABLE,
+                self.github_token.clone().unwrap_or_default(),
+            )
             .env("GIT_AUTHOR_NAME", &self.author_name)
             .env("GIT_AUTHOR_EMAIL", &self.author_email)
             .env("GIT_COMMITTER_NAME", &self.author_name)
@@ -463,6 +499,25 @@ mod tests {
         // And a name that is only a prefix of another must not match.
         let text = "artifacts:\n  CMILib: '1.4.*'\n";
         assert!(rewrite_pins(text, "CMI", "9.8.*").is_none());
+    }
+
+    #[test]
+    fn the_credential_helper_never_carries_the_token_itself() {
+        // The token has to reach git through the environment. Putting it in
+        // the helper string would put it in the process arguments, where
+        // anybody running ps can read it.
+        assert!(CREDENTIAL_HELPER.contains("$RCMD_GIT_TOKEN"));
+        assert!(CREDENTIAL_HELPER.contains("username=x-access-token"));
+        assert_eq!(TOKEN_VARIABLE, "RCMD_GIT_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn without_a_token_git_runs_with_no_credential_helper_at_all() {
+        // A helper configured with an empty token would answer every prompt
+        // with a blank password rather than failing honestly.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ConfigRepo::new(dir.path(), "main", None);
+        assert!(repo.github_token.is_none());
     }
 
     #[test]

@@ -61,10 +61,14 @@ Every key in `config.toml` is optional, these are the defaults:
 - `backup_destination` is where backups go, by default a local directory
 - `frozen_servers` is a list of servers nothing may restart, whoever asks. Put the one somebody spent a year setting up by hand in here
 - `non_minecraft_servers` is a list of processes that aren't Minecraft. They still start and stop, they just have no template
-- `player_count_url` is where to ask how many players are connected, so a restart can refuse to drop them. Anything answering with a bare number, or JSON with `players.online` or `online`, works
+- `log_files` is where to look for a server's log, relative to its directory, by default `["logs/latest.log", "logs/*.log"]`. Tried in order, first match wins, `*` is the only wildcard. Nothing matching is fine, rcmd falls back to the console
+- `log_files_by_server` overrides that for one server, for the process that keeps its log somewhere nobody would guess
+- `auto_start_on_boot` starts every stopped server when rcmd starts, off by default
 - `warn_command` is what to send before a restart, by default `say Restarting in {minutes} minute(s): {reason}`. `{minutes}`, `{seconds}` and `{reason}` are filled in
 - `warn_seconds` is how long to wait after warning, by default 0 which means don't warn at all
-- `discord_webhook_url` gets a summary after every pipeline run. Unset means no notifications
+- `discord_webhook_url` gets a summary after every pipeline run and a shout when a server crashes. Unset means no notifications. It's a credential, so you can put it in the environment as `RCMD_DISCORD_WEBHOOK_URL` instead
+- `instance_name` is what rcmd calls itself in a notification, so two of them posting into one channel can be told apart
+- `backup_schedule` and `restart_schedule` are when to back the fleet up and when to warn everybody and restart it. Both empty by default, because a tool that restarts your servers on a schedule you didn't ask for isn't a good tool
 - `push_window` limits when rcmd may push to a public repository, see below
 
 Each server also needs a `rcsm_config.json` in its own directory. If it's missing, rcmd writes one with Aikar's flags so at least the server can start:
@@ -152,6 +156,32 @@ The web interface asks before it draws the buttons, so a restart that would drop
 
 Tokens are `rcmt_` followed by a secret, and only the sha256 is stored. Losing one means making a new one, which is the point.
 
+### Logs
+
+The console is a tmux pane. It holds a few hundred lines and forgets the rest, and the thing you want to know almost always happened before that, so rcmd reads the log file instead when there is one.
+
+Which file is `log_files`, because `logs/latest.log` is a Minecraft convention and not everything rcmd supervises is Minecraft. The answer says which it gave you, `file` or `console`, so a surprising result can be explained.
+
+By default it looks for `logs/latest.log` then any `logs/*.log`, most recently written one first when several match. A map renderer that logs to the pane and nothing else just gets the pane, which is the right answer for it.
+
+### Plugins
+
+rcmd knows how to run servers. It doesn't know who's playing on them, and it shouldn't have to: that answer comes from a proxy, or a plugin on the proxy, or an endpoint somebody wrote, and every network does it differently.
+
+So a plugin is a small named thing that answers one kind of question:
+
+```toml
+[[plugins]]
+kind = "rcc"
+url = "https://rcc.redcraft.org/players.json"
+```
+
+`rcc` reads RedCraftChat's players endpoint. `json_roster` reads anything serving the same shape, `{"players": {"hub": [...]}}` or a bare `{"hub": [...]}`.
+
+Plugins are declared in the config and built into the binary rather than loaded at runtime. A single file you can copy onto a box is worth more than being able to drop shared objects next to it.
+
+Please notice that configuring one turns on the restart guard: without a plugin rcmd doesn't know whether anybody is connected, so it doesn't pretend to, and it never refuses. With one, it refuses to drop people unless you pass `force`.
+
 ### Console output
 
 Anything a player can type ends up in the console, so the API marks console responses as untrusted and the web interface shows a banner. Over MCP it comes back inside a fence that's measured against the content, so somebody typing a code block into chat can't close it and keep writing outside.
@@ -168,6 +198,8 @@ The web interface is just a client of this, it has no privileged path of its own
 - `POST /api/v1/servers/<server_name>/start`, `/stop`, `/restart`, `/backup`
 - `POST /api/v1/servers/<server_name>/command` with a JSON body like `{"command": "say hello"}`
 - `GET /api/v1/servers/<server_name>/console?lines=100`
+- `GET /api/v1/servers/<server_name>/log?lines=200&contains=<text>` for the log file, with far more history than the console. `contains` is a literal substring, not a pattern
+- `GET /api/v1/players` for who's connected, when a plugin reports it
 - `GET /api/v1/artifacts` and `GET /api/v1/artifacts/<artifact_name>/versions`
 - `POST /api/v1/artifacts/<artifact_name>/versions` to upload a jar by hand
 - `GET /api/v1/templates` and `POST /api/v1/templates/<template_name>/build`
@@ -187,6 +219,8 @@ rcmd speaks MCP on `POST /mcp`, with the same token and the same rules:
 `claude mcp add --transport http rcmd http://127.0.0.1:8484/mcp --header "Authorization: Bearer <your_token>"`
 
 The tools are thin wrappers around the API, so an assistant gets refused for exactly the reasons you would, and the refusal reads the same. There's a `check_first` tool that returns the verdicts without doing anything, which is worth asking before proposing a restart.
+
+`propose_catalog_entry` and `propose_pin` open pull requests against the config repository rather than changing anything directly, so an assistant adding a plugin goes through the same review as anybody else adding one.
 
 ## Checking your config
 

@@ -51,7 +51,7 @@ pub struct AppState {
     pub workspace: std::path::PathBuf,
     /// The config repository, when the configuration is in git.
     pub repo: Option<crate::gitconfig::ConfigRepo>,
-    pub notifier: crate::notify::Notifier,
+    pub notifier: Arc<crate::notify::Notifier>,
     /// One pipeline at a time. Two runs fetching the same artifacts into
     /// the same store is a race nobody needs to debug.
     pub pipeline_lock: tokio::sync::Mutex<()>,

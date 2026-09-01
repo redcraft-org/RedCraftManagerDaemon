@@ -61,6 +61,14 @@ pub struct Config {
     /// instead.
     pub pipeline_schedule: String,
 
+    /// When to back every server up. Empty disables it.
+    pub backup_schedule: String,
+
+    /// When to warn everybody and restart the whole fleet. Empty disables
+    /// it, and that is the default, because a tool that restarts your
+    /// servers on a schedule you did not ask for is not a good tool.
+    pub restart_schedule: String,
+
     /// Servers nothing may restart, whoever asks. Keep the one server
     /// somebody has spent a year setting up by hand in here.
     pub frozen_servers: Vec<String>,
@@ -88,8 +96,13 @@ pub struct Config {
     /// When pushes to public repositories are allowed. Unset means always.
     pub push_window: Option<PushWindow>,
 
-    /// Discord webhook for pipeline results. Unset means no notifications.
+    /// Discord webhook for pipeline results and server crashes. Unset means
+    /// no notifications.
     pub discord_webhook_url: Option<String>,
+
+    /// What to call this rcmd in a notification, so two of them posting into
+    /// the same channel can be told apart.
+    pub instance_name: String,
 
     /// The branch rcmd follows in the config repository, when the config
     /// directory is a git checkout.
@@ -163,6 +176,8 @@ impl Default for Config {
             artifact_directory: PathBuf::from("/var/lib/rcmd/artifacts"),
             build_directory: PathBuf::from("/var/lib/rcmd/builds"),
             pipeline_schedule: "0 3 * * *".into(),
+            backup_schedule: String::new(),
+            restart_schedule: String::new(),
             frozen_servers: vec![],
             non_minecraft_servers: vec![],
             player_count_url: None,
@@ -170,6 +185,7 @@ impl Default for Config {
             warn_seconds: 0,
             push_window: None,
             discord_webhook_url: None,
+            instance_name: "rcmd".into(),
             config_branch: "main".into(),
         }
     }
@@ -182,14 +198,45 @@ pub enum TemplateSource {
     None,
     /// Tars in a local directory, named `<server>.tar`.
     LocalDir { path: PathBuf },
-    // S3 { .. } lands with the artifact pipeline (M2/M4).
+    /// Tars in a bucket, under the same `<server>.tar` key the old daemon
+    /// used. Keeping the key identical is what makes a rollback possible.
+    S3 {
+        #[serde(flatten)]
+        bucket: crate::s3::BucketConfig,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackupDestination {
-    LocalDir { path: PathBuf },
-    // S3 { .. } later.
+    LocalDir {
+        path: PathBuf,
+    },
+    S3 {
+        #[serde(flatten)]
+        bucket: crate::s3::BucketConfig,
+        /// Where the archive goes. `{server}`, `{date}` and `{datetime}`
+        /// are filled in.
+        ///
+        /// :warning: :warning: :warning: The default overwrites the same key
+        /// every single run, which is what the old daemon did, so there is
+        /// only ever ONE backup per server and backing up a broken world
+        /// DESTROYS the good copy. Put `{date}` in here if you want
+        /// history, and keep an eye on what that costs you.
+        #[serde(default = "default_backup_key")]
+        key_template: String,
+        /// Where the archive is built before it goes up.
+        #[serde(default = "default_staging")]
+        staging_directory: PathBuf,
+    },
+}
+
+fn default_backup_key() -> String {
+    "{server}.tar.gz".into()
+}
+
+fn default_staging() -> PathBuf {
+    PathBuf::from("/var/lib/rcmd/backup-staging")
 }
 
 impl Config {

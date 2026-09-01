@@ -8,7 +8,7 @@
 //! `tar -xzf backup.tar.gz -C <server_dir>`.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -23,13 +23,17 @@ pub enum BackupError {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupReport {
-    pub archive: PathBuf,
+    /// Where the archive ended up. A path when it stayed local, an s3://
+    /// url when it was uploaded.
+    pub archive: String,
     pub bytes: u64,
     pub entries: u64,
     /// Configured directories that did not exist on disk; reported rather
     /// than silently skipped, because a typo in directories_to_backup
     /// otherwise looks identical to success.
     pub missing: Vec<String>,
+    /// True once the archive has reached the bucket.
+    pub uploaded: bool,
 }
 
 /// Writes `<destination_dir>/<server>.tar.gz` from the whitelist.
@@ -78,10 +82,11 @@ pub fn backup_server(
     fs::rename(&temp_path, &final_path)?;
     let bytes = fs::metadata(&final_path)?.len();
     Ok(BackupReport {
-        archive: final_path,
+        archive: final_path.display().to_string(),
         bytes,
         entries,
         missing,
+        uploaded: false,
     })
 }
 

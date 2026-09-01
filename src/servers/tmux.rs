@@ -41,13 +41,22 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone)]
 pub struct Tmux {
     prefix: String,
+    /// Which binary to run. Only ever anything other than "tmux" in a test
+    /// that needs the tmux call to fail on purpose.
+    binary: String,
 }
 
 impl Tmux {
     pub fn new(prefix: impl Into<String>) -> Self {
         Self {
             prefix: prefix.into(),
+            binary: "tmux".into(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_binary(binary: String, prefix: String) -> Self {
+        Self { prefix, binary }
     }
 
     pub fn session_name(&self, server: &str) -> String {
@@ -67,7 +76,7 @@ impl Tmux {
     }
 
     pub async fn session_exists(&self, server: &str) -> Result<bool, TmuxError> {
-        let status = Command::new("tmux")
+        let status = Command::new(&self.binary)
             .args(["has-session", "-t", &self.session_target(server)])
             .output()
             .await?;
@@ -91,7 +100,7 @@ impl Tmux {
         let split: Vec<&str> = start_command.split(' ').filter(|s| !s.is_empty()).collect();
         args.extend(split);
 
-        let out = Command::new("tmux")
+        let out = Command::new(&self.binary)
             .args(&args)
             .current_dir(server_dir)
             .output()
@@ -113,7 +122,7 @@ impl Tmux {
     /// Types a command into the session: literal keys, then Enter.
     pub async fn session_run_command(&self, server: &str, command: &str) -> Result<(), TmuxError> {
         let target = self.pane_target(server);
-        let out = Command::new("tmux")
+        let out = Command::new(&self.binary)
             .args(["send-keys", "-t", &target, "-l", command])
             .output()
             .await?;
@@ -123,7 +132,7 @@ impl Tmux {
                 stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             });
         }
-        let out = Command::new("tmux")
+        let out = Command::new(&self.binary)
             .args(["send-keys", "-t", &target, "Enter"])
             .output()
             .await?;
@@ -150,7 +159,7 @@ impl Tmux {
         if self.wait_for_state(server, false, timeout).await? {
             return Ok(false);
         }
-        let out = Command::new("tmux")
+        let out = Command::new(&self.binary)
             .args(["kill-session", "-t", &self.session_target(server)])
             .output()
             .await?;
@@ -171,7 +180,7 @@ impl Tmux {
     /// over SSH: `capture-pane -p -J -S -<lines>`.
     pub async fn capture_pane(&self, server: &str, lines: u32) -> Result<String, TmuxError> {
         let start = format!("-{lines}");
-        let out = Command::new("tmux")
+        let out = Command::new(&self.binary)
             .args([
                 "capture-pane",
                 "-t",
@@ -196,7 +205,7 @@ impl Tmux {
     /// what session adoption at boot reads.
     #[allow(dead_code)] // used by the cutover session-adoption path (M9)
     pub async fn list_sessions(&self) -> Result<Vec<String>, TmuxError> {
-        let out = Command::new("tmux")
+        let out = Command::new(&self.binary)
             .args(["ls", "-F", "#{session_name}"])
             .output()
             .await?;

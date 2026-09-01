@@ -8,16 +8,86 @@ use serde_json::json;
 
 use crate::pipeline::PipelineReport;
 
+/// How bad a thing is. Same four the old daemon used, so the Discord
+/// channel this posts into keeps looking exactly the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Warn,
+    Severe,
+    Fatal,
+}
+
+impl Level {
+    fn name(self) -> &'static str {
+        match self {
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
+            Level::Severe => "SEVERE",
+            Level::Fatal => "FATAL",
+        }
+    }
+
+    /// The embed colours the old daemon used, kept to the number so the
+    /// channel does not suddenly change palette mid cutover.
+    fn colour(self) -> u32 {
+        match self {
+            Level::Info => 1_499_250,
+            Level::Warn => 14_992_650,
+            Level::Severe => 16_144_655,
+            Level::Fatal => 16_141_655,
+        }
+    }
+}
+
 pub struct Notifier {
     webhook_url: Option<String>,
+    instance: String,
     client: reqwest::Client,
 }
 
 impl Notifier {
-    pub fn new(webhook_url: Option<String>) -> Self {
+    pub fn named(webhook_url: Option<String>, instance: String) -> Self {
         Self {
             webhook_url,
+            instance,
             client: reqwest::Client::new(),
+        }
+    }
+
+    /// Reports one thing that happened to one server.
+    ///
+    /// This is the alert that matters: a server crashing at 4am is worth
+    /// waking up for, and the daemon this replaces sent exactly these. It
+    /// would have been easy to drop them in the rewrite and not notice
+    /// until something crashed quietly.
+    pub async fn event(&self, level: Level, service: &str, message: &str) {
+        let Some(url) = self.webhook_url.as_deref() else {
+            return;
+        };
+        let payload = json!({
+            "content": "New event",
+            "embeds": [{
+                "color": level.colour(),
+                "fields": [
+                    { "name": "Level", "value": level.name(), "inline": true },
+                    { "name": "Instance", "value": self.instance, "inline": true },
+                    { "name": "Server/Service", "value": service, "inline": true },
+                    { "name": "Message", "value": message, "inline": false },
+                ],
+            }],
+        });
+        let result = self
+            .client
+            .post(url)
+            .timeout(std::time::Duration::from_secs(10))
+            .json(&payload)
+            .send()
+            .await;
+        match result {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => tracing::warn!("the webhook answered {}", response.status()),
+            Err(e) => tracing::warn!("could not reach the webhook: {e}"),
         }
     }
 
@@ -187,9 +257,20 @@ mod tests {
 
     #[tokio::test]
     async fn no_webhook_means_no_request_and_no_error() {
-        let notifier = Notifier::new(None);
+        let notifier = Notifier::named(None, "test".into());
         assert!(!notifier.is_configured());
         // Would panic on an unwrap if this tried to send anywhere.
         notifier.send("anything").await;
+        notifier.event(Level::Severe, "hub", "crashed").await;
+    }
+
+    #[test]
+    fn the_embed_colours_match_the_daemon_this_replaces() {
+        // Same numbers, so the Discord channel does not visibly change the
+        // day of the swap.
+        assert_eq!(Level::Info.colour(), 1_499_250);
+        assert_eq!(Level::Warn.colour(), 14_992_650);
+        assert_eq!(Level::Severe.colour(), 16_144_655);
+        assert_eq!(Level::Fatal.colour(), 16_141_655);
     }
 }

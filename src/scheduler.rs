@@ -101,26 +101,75 @@ fn field(spec: &str, min: u32, max: u32, name: &'static str) -> Result<Vec<u32>,
     Ok(out)
 }
 
-/// Starts the background timer. An empty expression disables it, which is
-/// what you want when a CI job drives the pipeline instead.
-pub fn spawn(state: Arc<AppState>, expression: &str) -> Option<tokio::task::JoinHandle<()>> {
+/// What a scheduled job does when it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    /// Fetch every artifact and rebuild what moved.
+    Pipeline,
+    /// Back up every server.
+    Backup,
+    /// Warn everybody, wait, and restart the fleet.
+    Restart,
+}
+
+impl Job {
+    fn audit_action(self) -> &'static str {
+        match self {
+            Job::Pipeline => "pipeline.run",
+            Job::Backup => "server.backup",
+            Job::Restart => "server.restart",
+        }
+    }
+
+    fn setting(self) -> &'static str {
+        match self {
+            Job::Pipeline => "pipeline_schedule",
+            Job::Backup => "backup_schedule",
+            Job::Restart => "restart_schedule",
+        }
+    }
+}
+
+/// Starts every schedule the config asks for.
+pub fn spawn_all(
+    state: Arc<AppState>,
+    config: &crate::config::Config,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    [
+        (Job::Pipeline, config.pipeline_schedule.as_str()),
+        (Job::Backup, config.backup_schedule.as_str()),
+        (Job::Restart, config.restart_schedule.as_str()),
+    ]
+    .into_iter()
+    .filter_map(|(job, expression)| spawn(state.clone(), job, expression))
+    .collect()
+}
+
+/// Starts one background timer. An empty expression disables it, which is
+/// what you want when something else drives that job.
+pub fn spawn(
+    state: Arc<AppState>,
+    job: Job,
+    expression: &str,
+) -> Option<tokio::task::JoinHandle<()>> {
     if expression.trim().is_empty() {
-        tracing::info!("no pipeline schedule set, nothing runs on its own");
+        tracing::info!("no {} set, nothing runs on its own", job.setting());
         return None;
     }
     let schedule = match Schedule::parse(expression) {
         Ok(schedule) => schedule,
         Err(e) => {
             // A typo in a cron line must not take the daemon down. Servers
-            // keep running, the nightly refresh just does not happen, and
-            // the log says so in as many words.
+            // keep running, that one job just does not happen, and the log
+            // says so in as many words.
             tracing::error!(
-                "pipeline_schedule {expression:?} is not valid: {e}. Nothing scheduled."
+                "{} {expression:?} is not valid: {e}. Nothing scheduled.",
+                job.setting()
             );
             return None;
         }
     };
-    tracing::info!("pipeline scheduled at {expression}");
+    tracing::info!("{:?} scheduled at {expression}", job);
 
     Some(tokio::spawn(async move {
         loop {
@@ -128,29 +177,48 @@ pub fn spawn(state: Arc<AppState>, expression: &str) -> Option<tokio::task::Join
             if !schedule.matches(chrono::Local::now()) {
                 continue;
             }
-            tracing::info!("scheduled pipeline run starting");
-            // Nobody asked for this one, so the audit log says who did.
-            let actor = crate::auth::Actor::system();
-            crate::auth::audit(
-                &state.database,
-                &actor,
-                "pipeline.run",
-                None,
-                "allowed",
-                Some("on schedule"),
-            )
-            .await;
-            match state.run_pipeline().await {
-                Ok(report) => tracing::info!(
-                    "pipeline finished: {} fetched, {} built, clean={}",
-                    report.fetched.len(),
-                    report.builds.len(),
-                    report.clean
-                ),
-                Err(e) => tracing::warn!("scheduled pipeline did not run: {e}"),
-            }
+            run(&state, job).await;
         }
     }))
+}
+
+async fn run(state: &Arc<AppState>, job: Job) {
+    tracing::info!("scheduled {:?} starting", job);
+    // Nobody asked for this one, so the audit log says who did.
+    let actor = crate::auth::Actor::system();
+    crate::auth::audit(
+        &state.database,
+        &actor,
+        job.audit_action(),
+        None,
+        "allowed",
+        Some("on schedule"),
+    )
+    .await;
+
+    match job {
+        Job::Pipeline => match state.run_pipeline().await {
+            Ok(report) => tracing::info!(
+                "pipeline finished: {} fetched, {} built, clean={}",
+                report.fetched.len(),
+                report.builds.len(),
+                report.clean
+            ),
+            Err(e) => tracing::warn!("scheduled pipeline did not run: {e}"),
+        },
+        Job::Backup => {
+            state.manager.backup_all().await;
+        }
+        Job::Restart => {
+            // Frozen servers are frozen on a schedule too. This is the one
+            // place a fleet wide job could quietly undo the whole point of
+            // marking a server as hands off.
+            state
+                .manager
+                .warn_and_restart_all(&state.frozen_servers)
+                .await;
+        }
+    }
 }
 
 /// Waits until the top of the next minute, so a run happens once per
@@ -204,6 +272,24 @@ mod tests {
         assert!(Schedule::parse("0 3 * * mon").is_err());
         assert!(Schedule::parse("*/0 3 * * *").is_err());
         assert!(Schedule::parse("5-1 3 * * *").is_err());
+    }
+
+    #[test]
+    fn the_schedules_redcraft_is_moving_off_cron_still_mean_the_same_thing() {
+        // These two came out of k8s CronJobs that published to Redis. If
+        // they drift, either the backups stop or the fleet restarts at the
+        // wrong hour, and both are the kind of thing you notice late.
+        let backup = Schedule::parse("15 */6 * * *").unwrap();
+        for hour in [0, 6, 12, 18] {
+            assert!(backup.matches(at(9, 1, hour, 15)), "missed {hour}:15");
+        }
+        assert!(!backup.matches(at(9, 1, 3, 15)));
+        assert!(!backup.matches(at(9, 1, 6, 0)));
+
+        let restart = Schedule::parse("45 5 * * *").unwrap();
+        assert!(restart.matches(at(9, 1, 5, 45)));
+        assert!(!restart.matches(at(9, 1, 6, 45)));
+        assert!(!restart.matches(at(9, 1, 5, 46)));
     }
 
     #[test]

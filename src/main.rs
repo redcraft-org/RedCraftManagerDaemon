@@ -15,6 +15,7 @@ mod mcp;
 mod notify;
 mod pipeline;
 mod policy;
+mod s3;
 mod scheduler;
 mod servers;
 mod store;
@@ -192,7 +193,15 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let manager = Arc::new(servers::Manager::new(&config));
+        let notifier = Arc::new(notify::Notifier::named(
+            config.discord_webhook_url.clone(),
+            config.instance_name.clone(),
+        ));
+
+        let mut manager = servers::Manager::new(&config);
+        manager.set_notifier(notifier.clone());
+        manager.open_buckets().await?;
+        let manager = Arc::new(manager);
         let discovered = manager.discover().await?;
         tracing::info!(
             "supervising {} servers: {}",
@@ -282,11 +291,11 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
             build_directory: config.build_directory.clone(),
             workspace: config.build_directory.join(".work"),
             repo: config_repo,
-            notifier: notify::Notifier::new(config.discord_webhook_url.clone()),
+            notifier,
             pipeline_lock: tokio::sync::Mutex::new(()),
         });
 
-        let _scheduler = scheduler::spawn(state.clone(), &config.pipeline_schedule);
+        let _schedules = scheduler::spawn_all(state.clone(), &config);
 
         let app = api::router(state);
 

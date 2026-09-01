@@ -114,6 +114,21 @@ struct ServerEntry {
     crashes: Mutex<CrashTracker>,
 }
 
+/// What a fleet wide job did.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct FleetReport {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warned: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub restarted: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub backed_up: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
+}
+
 pub struct Manager {
     tmux: Tmux,
     servers: RwLock<HashMap<String, Arc<ServerEntry>>>,
@@ -126,6 +141,20 @@ pub struct Manager {
     /// What to send before a restart, with `{minutes}` and `{reason}`.
     warn_command: String,
     warn_seconds: u64,
+    /// Opened once at startup, because opening a client per apply would
+    /// mean a template download that is mostly handshake.
+    template_bucket: Option<Arc<crate::s3::Bucket>>,
+    backup_bucket: Option<Arc<crate::s3::Bucket>>,
+    /// Where a crash goes when nobody is looking at the log.
+    notifier: Option<Arc<crate::notify::Notifier>>,
+    /// Servers the automatic paths must not touch.
+    ///
+    /// The policy layer already refuses to restart these when a person
+    /// asks, but the healthcheck never goes through the policy layer, and
+    /// the healthcheck is the thing most likely to touch a server at 4am.
+    /// A frozen server that gets revived and re-templated automatically is
+    /// not frozen in any sense that matters.
+    frozen: Vec<String>,
 }
 
 impl Manager {
@@ -137,6 +166,10 @@ impl Manager {
             stop_timeout: Duration::from_secs(config.stop_timeout_secs),
             crash_max_tries: config.crash_max_tries,
             crash_window: Duration::from_secs(config.crash_window_secs),
+            template_bucket: None,
+            backup_bucket: None,
+            notifier: None,
+            frozen: config.frozen_servers.clone(),
             warn_command: config.warn_command.clone(),
             warn_seconds: config.warn_seconds,
             template_source: config.template_source.clone(),
@@ -168,15 +201,30 @@ impl Manager {
                 continue;
             }
 
-            let alive = self.tmux.session_exists(&name).await.unwrap_or(false);
-            let state = if alive {
-                tracing::info!("adopted running session for {name}");
-                ServerState::Running
-            } else {
-                if let Err(e) = self.update_template(&name, &dir).await {
-                    tracing::warn!("template refresh for {name} failed: {e}");
+            // A tmux query that FAILED is not the same as a server that is
+            // stopped, and the difference is not academic: applying a
+            // template deletes and rewrites every directory the tar names.
+            // Getting this wrong once, by running as the wrong user or with
+            // a private /tmp, would wipe plugins/ out from under eight
+            // running servers. So an error leaves the server alone.
+            let state = match self.tmux.session_exists(&name).await {
+                Ok(true) => {
+                    tracing::info!("adopted running session for {name}");
+                    ServerState::Running
                 }
-                ServerState::Stopped
+                Ok(false) => {
+                    if let Err(e) = self.update_template(&name, &dir).await {
+                        tracing::warn!("template refresh for {name} failed: {e}");
+                    }
+                    ServerState::Stopped
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "could not ask tmux about {name} ({e}). Leaving it alone: \
+                         rcmd will not touch a server it cannot see."
+                    );
+                    ServerState::Stopped
+                }
             };
 
             self.servers.write().await.insert(
@@ -261,7 +309,77 @@ impl Manager {
                 );
                 Ok(true)
             }
+            TemplateSource::S3 { .. } => {
+                let Some(bucket) = self.template_bucket.as_ref() else {
+                    return Err(ServerError::Config(
+                        "the template bucket is configured but was never opened".into(),
+                    ));
+                };
+                let key = crate::s3::template_key(name);
+                let bytes = match bucket.get(&key).await {
+                    Ok(bytes) => bytes,
+                    // A server with no template in the bucket is not a
+                    // failure. It is a server nobody templates.
+                    Err(crate::s3::S3Error::Missing { .. }) => {
+                        tracing::warn!("no template at {}/{key}", bucket.name());
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(ServerError::Config(e.to_string())),
+                };
+
+                let dir = dir.to_path_buf();
+                let size = bytes.len();
+                let report = tokio::task::spawn_blocking(move || {
+                    apply::apply_tar_reader(std::io::Cursor::new(bytes), &dir)
+                })
+                .await
+                .map_err(|e| ServerError::Config(format!("apply task panicked: {e}")))?;
+                let report = report?;
+                tracing::info!(
+                    "applied template for {name} from {}/{key} ({size} bytes): {} files, {} dirs replaced",
+                    bucket.name(),
+                    report.files_written,
+                    report.dirs_replaced
+                );
+                Ok(true)
+            }
         }
+    }
+
+    /// Opens whichever buckets the config asks for.
+    ///
+    /// Called once at startup and separate from `new` because it needs the
+    /// runtime and can fail. A bucket that will not open is fatal on
+    /// purpose: starting anyway would mean a daemon that silently stops
+    /// applying templates, and finding that out at the next crash revive
+    /// is the worst possible moment.
+    /// Hands the manager somewhere to shout when a server falls over.
+    pub fn set_notifier(&mut self, notifier: Arc<crate::notify::Notifier>) {
+        self.notifier = Some(notifier);
+    }
+
+    async fn tell(&self, level: crate::notify::Level, server: &str, message: &str) {
+        if let Some(notifier) = &self.notifier {
+            notifier.event(level, server, message).await;
+        }
+    }
+
+    pub async fn open_buckets(&mut self) -> Result<(), ServerError> {
+        if let TemplateSource::S3 { bucket } = &self.template_source {
+            let opened = crate::s3::Bucket::connect(bucket)
+                .await
+                .map_err(|e| ServerError::Config(format!("template bucket: {e}")))?;
+            tracing::info!("templates come from {}", opened.name());
+            self.template_bucket = Some(Arc::new(opened));
+        }
+        if let BackupDestination::S3 { bucket, .. } = &self.backup_destination {
+            let opened = crate::s3::Bucket::connect(bucket)
+                .await
+                .map_err(|e| ServerError::Config(format!("backup bucket: {e}")))?;
+            tracing::info!("backups go to {}", opened.name());
+            self.backup_bucket = Some(Arc::new(opened));
+        }
+        Ok(())
     }
 
     /// Operator-initiated start. Clears the crash history, because a human
@@ -271,6 +389,8 @@ impl Manager {
         let result = self.start_inner(name).await;
         if result.is_ok() {
             self.entry(name).await?.crashes.lock().await.reset();
+            self.tell(crate::notify::Level::Info, name, "Server started")
+                .await;
         }
         result
     }
@@ -332,9 +452,23 @@ impl Manager {
                 "timeout shutdown of {}s reached for {name}, killed the session",
                 self.stop_timeout.as_secs()
             );
+            // Worth an alert: a server that will not shut down cleanly is
+            // usually a server that is about to lose the last few minutes
+            // of whatever it had in memory.
+            self.tell(
+                crate::notify::Level::Warn,
+                name,
+                &format!(
+                    "Did not stop within {}s, killed the session",
+                    self.stop_timeout.as_secs()
+                ),
+            )
+            .await;
         }
         *entry.state.write().await = ServerState::Stopped;
         tracing::info!("stopped {name}");
+        self.tell(crate::notify::Level::Info, name, "Server stopped")
+            .await;
         Ok(())
     }
 
@@ -398,6 +532,102 @@ impl Manager {
         Ok(minutes)
     }
 
+    /// Warns the whole fleet once, waits once, then restarts it.
+    ///
+    /// The warning goes to every server first and the wait happens once,
+    /// rather than warning and waiting per server. Doing it the other way
+    /// would take eight times fifteen minutes and the last server would be
+    /// restarting two hours after the message that told people it would.
+    ///
+    /// Templates are deliberately NOT applied here. On RedCraft the warn
+    /// command is a plugin that counts down and then shuts the server down
+    /// itself, which the healthcheck sees as a crash, and a crash revive
+    /// pulls a fresh template. That is how updates actually land, and this
+    /// keeps it that way.
+    pub async fn warn_and_restart_all(&self, skip: &[String]) -> FleetReport {
+        let names: Vec<String> = self
+            .servers
+            .read()
+            .await
+            .keys()
+            .filter(|name| !skip.contains(name))
+            .cloned()
+            .collect();
+
+        let mut report = FleetReport {
+            skipped: skip.to_vec(),
+            ..Default::default()
+        };
+
+        let seconds = self.warn_seconds;
+        if seconds > 0 && !self.warn_command.trim().is_empty() {
+            let minutes = seconds.div_ceil(60);
+            let line = self
+                .warn_command
+                .replace("{minutes}", &minutes.to_string())
+                .replace("{seconds}", &seconds.to_string())
+                .replace("{reason}", "Automated daily updates and restart");
+            for name in &names {
+                // A server that is already down needs no warning, and
+                // sending one to a dead session is just an error in the log.
+                if !self.tmux.session_exists(name).await.unwrap_or(false) {
+                    continue;
+                }
+                match self.tmux.session_run_command(name, &line).await {
+                    Ok(()) => report.warned.push(name.clone()),
+                    Err(e) => tracing::warn!("could not warn {name}: {e}"),
+                }
+            }
+            tracing::info!(
+                "warned {} server(s), restarting the fleet in {seconds}s",
+                report.warned.len()
+            );
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+        }
+
+        for name in &names {
+            match self.restart(name, false).await {
+                Ok(()) => report.restarted.push(name.clone()),
+                Err(e) => {
+                    tracing::error!("could not restart {name}: {e}");
+                    report.failed.push(format!("{name}: {e}"));
+                }
+            }
+        }
+        tracing::info!(
+            "fleet restart done: {} restarted, {} failed, {} skipped",
+            report.restarted.len(),
+            report.failed.len(),
+            report.skipped.len()
+        );
+        report
+    }
+
+    /// Backs up every server, one at a time.
+    ///
+    /// Sequentially on purpose: eight simultaneous tar and gzip runs over
+    /// the same disk is slower than doing them in order, and it competes
+    /// with the servers for io while people are playing.
+    pub async fn backup_all(&self) -> FleetReport {
+        let names: Vec<String> = self.servers.read().await.keys().cloned().collect();
+        let mut report = FleetReport::default();
+        for name in names {
+            match self.backup(&name).await {
+                Ok(_) => report.backed_up.push(name),
+                Err(e) => {
+                    tracing::error!("could not back up {name}: {e}");
+                    report.failed.push(format!("{name}: {e}"));
+                }
+            }
+        }
+        tracing::info!(
+            "fleet backup done: {} succeeded, {} failed",
+            report.backed_up.len(),
+            report.failed.len()
+        );
+        report
+    }
+
     pub async fn run_command(&self, name: &str, command: &str) -> Result<(), ServerError> {
         let entry = self.entry(name).await?;
         if !self.tmux.session_exists(name).await? {
@@ -420,10 +650,18 @@ impl Manager {
         let entry = self.entry(name).await?;
         let config =
             ServerConfig::read(&entry.dir).map_err(|e| ServerError::Config(e.to_string()))?;
-        let BackupDestination::LocalDir { path } = &self.backup_destination;
+        let (staging, upload) = match &self.backup_destination {
+            BackupDestination::LocalDir { path } => (path.clone(), None),
+            BackupDestination::S3 {
+                key_template,
+                staging_directory,
+                ..
+            } => (staging_directory.clone(), Some(key_template.to_string())),
+        };
+
         let dir = entry.dir.clone();
-        let dest = path.clone();
-        let report = tokio::task::spawn_blocking(move || {
+        let dest = staging.clone();
+        let mut report = tokio::task::spawn_blocking(move || {
             backup::backup_server(
                 &dir.file_name().unwrap().to_string_lossy(),
                 &dir,
@@ -433,6 +671,29 @@ impl Manager {
         })
         .await
         .map_err(|e| ServerError::Config(format!("backup task panicked: {e}")))??;
+
+        if let Some(key_template) = upload {
+            let Some(bucket) = self.backup_bucket.as_ref() else {
+                return Err(ServerError::Config(
+                    "the backup bucket is configured but was never opened".into(),
+                ));
+            };
+            let key = crate::s3::backup_key(&key_template, name, chrono::Utc::now());
+            let local = std::path::PathBuf::from(&report.archive);
+            bucket
+                .put_file(&key, &local)
+                .await
+                .map_err(|e| ServerError::Config(e.to_string()))?;
+            tracing::info!("uploaded {name} backup to {}/{key}", bucket.name());
+
+            // The staging copy has served its purpose. Leaving them around
+            // fills the disk with the one thing you cannot afford to have
+            // fill the disk.
+            let _ = std::fs::remove_file(&local);
+            report.archive = format!("s3://{}/{key}", bucket.name());
+            report.uploaded = true;
+        }
+
         tracing::info!("backed up {name}: {} bytes", report.bytes);
         Ok(report)
     }
@@ -466,20 +727,58 @@ impl Manager {
                 continue;
             }
 
+            if self.frozen.contains(&name) {
+                // Say it once, then stop believing it is running, so this
+                // does not repeat every second forever.
+                tracing::warn!("{name} is frozen and its session is gone, leaving it down");
+                *entry.state.write().await = ServerState::Stopped;
+                self.tell(
+                    crate::notify::Level::Warn,
+                    &name,
+                    "Session is gone, but this server is frozen so rcmd is leaving it alone",
+                )
+                .await;
+                continue;
+            }
+
             let decision = entry.crashes.lock().await.record_crash(Instant::now());
             match decision {
                 CrashDecision::GiveUp => {
                     tracing::error!("server crash bootloop detected for {name}, giving up");
                     *entry.state.write().await = ServerState::Crashed { bootloop: true };
+                    self.tell(
+                        crate::notify::Level::Fatal,
+                        &name,
+                        "Server crash bootloop detected, leaving it down",
+                    )
+                    .await;
                 }
                 CrashDecision::Revive { attempt } => {
                     tracing::warn!("{name} is stopped, restarting (attempt {attempt})");
                     *entry.state.write().await = ServerState::Crashed { bootloop: false };
+                    self.tell(
+                        crate::notify::Level::Severe,
+                        &name,
+                        &format!("Server is stopped, restarting (attempt {attempt})"),
+                    )
+                    .await;
                     if let Err(e) = self.update_template(&name, &entry.dir).await {
                         tracing::warn!("template refresh during revive of {name} failed: {e}");
+                        self.tell(
+                            crate::notify::Level::Warn,
+                            &name,
+                            &format!("Could not refresh the template before reviving: {e}"),
+                        )
+                        .await;
                     }
                     if let Err(e) = self.start_inner(&name).await {
                         tracing::error!("revive of {name} failed: {e}");
+                        self.tell(
+                            crate::notify::Level::Fatal,
+                            &name,
+                            &format!("Revive failed: {e}"),
+                        )
+                        .await;
                     }
                 }
             }
@@ -503,6 +802,82 @@ impl Manager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with(frozen: Vec<&str>, dir: &std::path::Path) -> Config {
+        Config {
+            servers_directory: dir.to_path_buf(),
+            tmux_session_prefix: "rcmdtest_".into(),
+            frozen_servers: frozen.into_iter().map(String::from).collect(),
+            ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tmux_error_never_makes_rcmd_write_to_a_server() {
+        // The dangerous shape: rcmd cannot see the sessions (wrong user,
+        // private /tmp), concludes every server is stopped, and applies a
+        // template, which deletes and rewrites directories under eight
+        // running JVMs. An unanswerable question must mean "hands off".
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("hub");
+        std::fs::create_dir_all(server.join("plugins")).unwrap();
+        std::fs::write(server.join("plugins/Keep.jar"), b"precious").unwrap();
+
+        // A template that would wipe plugins/ if it were ever applied.
+        let templates = dir.path().join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        let tar_path = templates.join("hub.tar");
+        {
+            let file = std::fs::File::create(&tar_path).unwrap();
+            let mut builder = tar::Builder::new(file);
+            let mut header = tar::Header::new_gnu();
+            let body = b"replaced";
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "plugins/Other.jar", &body[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut config = config_with(vec![], dir.path());
+        config.template_source = TemplateSource::LocalDir { path: templates };
+        // A prefix nothing will ever match is not the failure mode here;
+        // point tmux at a binary that does not exist so the query errors.
+        let mut manager = Manager::new(&config);
+        manager.tmux = Tmux::with_binary("rcmd-no-such-tmux".into(), "rcmdtest_".into());
+
+        manager.discover().await.unwrap();
+
+        // The jar is still there, and nothing from the template arrived.
+        assert!(server.join("plugins/Keep.jar").exists());
+        assert!(!server.join("plugins/Other.jar").exists());
+    }
+
+    #[tokio::test]
+    async fn a_frozen_server_is_not_revived_by_the_healthcheck() {
+        // The policy layer refuses a restart of a frozen server when a
+        // person asks, but the healthcheck never goes near the policy
+        // layer, so without this the automatic path quietly does the thing
+        // freezing was supposed to prevent.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("crea_engineer_test")).unwrap();
+        let config = config_with(vec!["crea_engineer_test"], dir.path());
+        let manager = Manager::new(&config);
+        manager.discover().await.unwrap();
+
+        let entry = manager.entry("crea_engineer_test").await.unwrap();
+        *entry.state.write().await = ServerState::Running;
+
+        // No session exists, so this looks exactly like a crash.
+        manager.healthcheck_sweep().await;
+
+        // Left down rather than revived, and no crash recorded against it.
+        assert_eq!(*entry.state.read().await, ServerState::Stopped);
+        assert_eq!(entry.crashes.lock().await.tries(), 0);
+    }
 
     #[test]
     fn bootloop_math_matches_rcsm() {

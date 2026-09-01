@@ -29,6 +29,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 async-trait = "0.1.92"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "any", "sqlite", "mysql", "chrono"] }
 serde_yaml = "0.9.34"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 rand = "0.9"
 base64 = "0.22"
 

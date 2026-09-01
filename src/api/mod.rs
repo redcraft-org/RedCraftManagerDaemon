@@ -281,6 +281,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/tokens/{id}", axum::routing::delete(revoke_token))
         .route("/api/v1/audit", get(list_audit))
         .route("/api/v1/whoami", get(whoami))
+        .route("/mcp", post(crate::mcp::handle))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }

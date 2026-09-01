@@ -11,6 +11,7 @@ mod catalog;
 mod config;
 mod domain;
 mod gitconfig;
+mod mcp;
 mod notify;
 mod pipeline;
 mod policy;

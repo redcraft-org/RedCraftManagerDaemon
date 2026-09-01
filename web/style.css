@@ -112,7 +112,67 @@ main { padding: 20px; max-width: 1100px; margin: 0 auto; }
   display: grid;
   gap: 12px;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  /* Without this a grid row is as tall as its tallest card, so one
+     template with twenty six pins turns every card beside it into a tall
+     empty box. */
+  align-items: start;
 }
+
+/* Templates */
+
+.tmpl-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.tmpl-head h3 { margin-right: auto; }
+
+/* The layer chain, which is the whole mental model of the template system
+   and used to be a footnote at the bottom of the card. */
+.chain {
+  color: var(--dim);
+  font-size: 12.5px;
+  font-family: var(--mono);
+  margin-bottom: 10px;
+  word-break: break-word;
+}
+
+.chain .here { color: var(--text); }
+
+.disclosure {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--dim);
+  font-weight: 400;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.disclosure:hover:not(:disabled) { color: var(--text); }
+.disclosure .caret { margin-left: auto; font-size: 10px; }
+
+.pins {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 1px 12px;
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.pins > span { padding: 2px 0; }
+.pins .version { font-family: var(--mono); color: var(--dim); }
+
+/* A pin the parent layer already set, versus one this template chose. The
+   distinction is the difference between reading a template and reading the
+   whole chain in your head. */
+.pins .inherited { color: var(--dim); opacity: 0.6; }
 
 .card {
   background: var(--panel);

@@ -342,62 +342,121 @@ function cell(value, className) {
 
 /* Templates */
 
+// Which template cards are open. Kept out here because the page rebuilds
+// itself every five seconds, and a list that collapses under you while you
+// are reading it is worse than one that never opened.
+const expandedTemplates = new Set();
+
 async function loadTemplates() {
   const body = await api("/api/v1/templates");
   const grid = $("templates");
   grid.replaceChildren();
   $("templates-empty").hidden = body.templates.length > 0;
 
+  const byName = new Map(body.templates.map((t) => [t.name, t]));
+
   for (const template of body.templates) {
-    const card = el("div", "card");
-    const head = el("div", "card-head");
-    head.appendChild(el("h3", null, template.name));
-    if (!template.buildable) {
-      head.appendChild(el("span", "state", "layer only"));
-    }
-    card.appendChild(head);
-
-    if (template.inherits) {
-      card.appendChild(el("div", "sub", "inherits " + template.inherits));
-    }
-
-    const pins = Object.entries(template.artifacts || {});
-    if (pins.length) {
-      const table = el("table", "list");
-      const tbody = document.createElement("tbody");
-      for (const [name, pin] of pins) {
-        const row = document.createElement("tr");
-        row.appendChild(cell(name));
-        row.appendChild(cell(pin, "right mono dim"));
-        tbody.appendChild(row);
-      }
-      table.appendChild(tbody);
-      card.appendChild(table);
-    }
-
-    if (template.buildable) {
-      const actions = el("div", "actions");
-      const build = el("button", null, "build");
-      build.addEventListener("click", async () => {
-        build.disabled = true;
-        try {
-          const result = await api(
-            "/api/v1/templates/" + encodeURIComponent(template.name) + "/build",
-            { method: "POST", body: {} }
-          );
-          toast("built " + result.build.template, "ok");
-        } catch (e) {
-          toast(e.message, "bad");
-        } finally {
-          build.disabled = false;
-        }
-      });
-      actions.appendChild(build);
-      card.appendChild(actions);
-    }
-
-    grid.appendChild(card);
+    grid.appendChild(templateCard(template, byName));
   }
+}
+
+// common_spigot > crea_common > crea_build_plot, walking up the inherits
+// chain. Guarded against a cycle because a config repository is a thing
+// people edit by hand.
+function chainOf(template, byName) {
+  const chain = [];
+  let current = template;
+  while (current && !chain.includes(current.name) && chain.length < 20) {
+    chain.unshift(current.name);
+    current = current.inherits ? byName.get(current.inherits) : null;
+  }
+  return chain;
+}
+
+function templateCard(template, byName) {
+  const card = el("div", "card");
+
+  const head = el("div", "tmpl-head");
+  head.appendChild(el("h3", null, template.name));
+  if (!template.buildable) head.appendChild(el("span", "state", "layer only"));
+  if (template.buildable) head.appendChild(buildButton(template.name));
+  card.appendChild(head);
+
+  const chain = chainOf(template, byName);
+  if (chain.length > 1) {
+    const line = el("div", "chain");
+    chain.forEach((name, i) => {
+      if (i) line.appendChild(text(" > "));
+      line.appendChild(el("span", i === chain.length - 1 ? "here" : null, name));
+    });
+    card.appendChild(line);
+  }
+
+  const pins = Object.entries(template.artifacts || {});
+  if (!pins.length) {
+    card.appendChild(el("div", "sub", "pins nothing"));
+    return card;
+  }
+
+  // A pin counts as this template's own when the parent either does not
+  // have it or has it at a different version.
+  const parent = template.inherits ? byName.get(template.inherits) : null;
+  const inheritedFrom = (parent && parent.artifacts) || {};
+  const own = pins.filter(([name, pin]) => inheritedFrom[name] !== pin).length;
+
+  const open = expandedTemplates.has(template.name);
+  const toggle = el("button", "disclosure");
+  toggle.appendChild(text(pinLabel(pins.length, own, Boolean(template.inherits))));
+  toggle.appendChild(el("span", "caret", open ? "\u25be" : "\u25b8"));
+  toggle.addEventListener("click", () => {
+    if (expandedTemplates.has(template.name)) expandedTemplates.delete(template.name);
+    else expandedTemplates.add(template.name);
+    loadTemplates();
+  });
+  card.appendChild(toggle);
+
+  if (open) {
+    const list = el("div", "pins");
+    for (const [name, pin] of pins) {
+      const inherited = inheritedFrom[name] === pin;
+      list.appendChild(el("span", inherited ? "inherited" : null, name));
+      const version = el("span", "version" + (inherited ? " inherited" : ""), pin);
+      version.title = inherited ? "inherited from " + template.inherits : "set by " + template.name;
+      list.appendChild(version);
+    }
+    card.appendChild(list);
+  }
+
+  return card;
+}
+
+// "26 pins, 2 set here" tells you more than "26 pins", but only when the
+// second number is worth saying. Nought set here means the whole list came
+// down the chain, which is worth saying differently rather than as "0".
+function pinLabel(total, own, inherits) {
+  const noun = total === 1 ? " pin" : " pins";
+  if (!inherits || own === total) return total + noun;
+  if (own === 0) return total + noun + ", all inherited";
+  return total + noun + ", " + own + " set here";
+}
+
+function buildButton(name) {
+  const build = el("button", null, "build");
+  build.addEventListener("click", async () => {
+    build.disabled = true;
+    try {
+      const result = await api(
+        "/api/v1/templates/" + encodeURIComponent(name) + "/build",
+        { method: "POST", body: {} }
+      );
+      toast("built " + result.build.template, "ok");
+    } catch (e) {
+      toast(e.message, "bad");
+    } finally {
+      build.disabled = false;
+    }
+  });
+  return build;
 }
 
 /* Pipeline */

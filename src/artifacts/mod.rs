@@ -117,63 +117,159 @@ pub async fn fetch_one(
         Ok(pair) => pair,
         Err(e) => return FetchOutcome::failed(&artifact.name, e),
     };
-    let sha = sha256_hex(&bytes);
+    match store_bytes(
+        store,
+        manifest,
+        artifact,
+        &meta.version,
+        &bytes,
+        &release.url,
+        release.upstream_id.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => FetchOutcome::failed(&artifact.name, e),
+    }
+}
 
-    match manifest.has_version(&artifact.name, &meta.version).await {
-        Ok(Some(existing)) if existing.sha256 == sha => {
-            return FetchOutcome {
+/// Records bytes we already have as a version of an artifact.
+///
+/// Shared by the download path and the upload one, so a jar that arrived by
+/// hand is stored, deduplicated and pinned exactly like one that arrived on
+/// its own. The comparison is the sha, not the version string: a source
+/// rebuilding a release under the same number is normal, and the only
+/// honest way to tell whether anything changed is to look at the bytes.
+pub async fn store_bytes(
+    store: &dyn store::ArtifactStore,
+    manifest: &dyn store::Manifest,
+    artifact: &Artifact,
+    version: &str,
+    bytes: &[u8],
+    source_url: &str,
+    upstream_id: Option<&str>,
+) -> Result<FetchOutcome, store::StoreError> {
+    let sha = sha256_hex(bytes);
+
+    if let Some(existing) = manifest.has_version(&artifact.name, version).await? {
+        if existing.sha256 == sha {
+            return Ok(FetchOutcome {
                 name: artifact.name.clone(),
                 succeeded: true,
                 action: "unchanged",
-                version: Some(meta.version),
+                version: Some(version.to_string()),
                 sha256: Some(sha),
                 error: None,
-            };
+            });
         }
-        Ok(_) => {}
-        Err(e) => return FetchOutcome::failed(&artifact.name, e),
     }
 
-    let key = format!("{}-{}.jar", artifact.name, meta.version);
-    if let Err(e) = store.put(&key, &bytes).await {
-        return FetchOutcome::failed(&artifact.name, e);
-    }
+    let key = format!("{}-{}.jar", artifact.name, version);
+    store.put(&key, bytes).await?;
 
     let record = store::VersionRecord {
         artifact: artifact.name.clone(),
         kind: artifact.kind,
-        version: meta.version.clone(),
+        version: version.to_string(),
         sha256: sha.clone(),
         size_bytes: bytes.len() as u64,
         key,
-        upstream_id: release.upstream_id,
-        source_url: release.url,
+        upstream_id: upstream_id.map(str::to_string),
+        source_url: source_url.to_string(),
         recorded_at: chrono::Utc::now(),
     };
-    if let Err(e) = manifest.record(&record).await {
-        return FetchOutcome::failed(&artifact.name, e);
-    }
+    manifest.record(&record).await?;
 
-    tracing::info!(
-        "stored {} {} ({} from {})",
-        artifact.name,
-        meta.version,
-        &sha[..12],
-        meta.source_file
-    );
-    FetchOutcome {
+    tracing::info!("stored {} {} ({})", artifact.name, version, &sha[..12]);
+    Ok(FetchOutcome {
         name: artifact.name.clone(),
         succeeded: true,
         action: "stored",
-        version: Some(meta.version),
+        version: Some(version.to_string()),
         sha256: Some(sha),
         error: None,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::store::tests_support::MemoryManifest;
+    use crate::artifacts::store::{ArtifactStore, DirectoryStore, Manifest};
+
+    fn uploadable() -> Artifact {
+        Artifact {
+            name: "CMI".into(),
+            kind: Kind::Plugin,
+            source: SourceKind::Direct,
+            url: "https://example.invalid/cmi.jar".into(),
+            file_filter: None,
+            archive_filter: None,
+            post_processors: vec![],
+            enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_jar_uploaded_twice_is_only_stored_once() {
+        // The premium plugins arrive by hand, and somebody pasting the same
+        // curl twice should not fill the manifest with duplicates.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DirectoryStore::new(dir.path());
+        let manifest = MemoryManifest::default();
+        let artifact = uploadable();
+
+        let first = store_bytes(
+            &store,
+            &manifest,
+            &artifact,
+            "9.8.1",
+            b"jar bytes",
+            "by hand",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.action, "stored");
+
+        let again = store_bytes(
+            &store,
+            &manifest,
+            &artifact,
+            "9.8.1",
+            b"jar bytes",
+            "by hand",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.action, "unchanged");
+        assert_eq!(manifest.versions("CMI").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_same_version_with_different_bytes_replaces_it() {
+        // A source that rebuilds a release under the same number is normal,
+        // and the sha is the only honest way to notice.
+        let dir = tempfile::tempdir().unwrap();
+        let store = DirectoryStore::new(dir.path());
+        let manifest = MemoryManifest::default();
+        let artifact = uploadable();
+
+        store_bytes(
+            &store, &manifest, &artifact, "9.8.1", b"first", "by hand", None,
+        )
+        .await
+        .unwrap();
+        let rebuilt = store_bytes(
+            &store, &manifest, &artifact, "9.8.1", b"second", "by hand", None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rebuilt.action, "stored");
+        assert_eq!(store.get("CMI-9.8.1.jar").await.unwrap(), b"second");
+    }
+
     use crate::catalog::{Kind, SourceKind};
     use std::io::{Cursor, Write};
 

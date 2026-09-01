@@ -272,7 +272,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/servers/{name}/console", get(console))
         .route("/api/v1/servers/{name}/backup", post(backup))
         .route("/api/v1/artifacts", get(list_artifacts))
-        .route("/api/v1/artifacts/{name}/versions", get(artifact_versions))
+        .route(
+            "/api/v1/artifacts/{name}/versions",
+            get(artifact_versions).post(upload_version),
+        )
         .route("/api/v1/templates", get(list_templates))
         .route("/api/v1/templates/{name}/build", post(build_template))
         .route("/api/v1/pipeline/run", post(run_pipeline))
@@ -756,4 +759,80 @@ async fn list_audit(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(json!({ "audit": entries })))
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    /// The version these bytes are. Read out of the jar when left off.
+    version: Option<String>,
+}
+
+/// Puts a jar into the store by hand.
+///
+/// Some plugins live behind a login and a bot check, and no amount of
+/// cleverness makes downloading them reliable. Rather than have the whole
+/// pipeline depend on beating a challenge page, those get uploaded here and
+/// then behave like everything else: pinned, resolved, built and deployed
+/// by the same code.
+///
+/// Send the jar as the body, nothing else:
+///
+///     curl -T CMI9.8.1.jar -H "Authorization: Bearer $TOKEN" \
+///          "http://localhost:8484/api/v1/artifacts/CMI/versions"
+async fn upload_version(
+    State(state): State<Arc<AppState>>,
+    Caller(actor): Caller,
+    Path(name): Path<String>,
+    Query(query): Query<UploadQuery>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    state
+        .authorize(&actor, Action::BuildTemplate { name: name.clone() }, false)
+        .await?;
+    if body.is_empty() {
+        return Err(ApiError::BadRequest("that upload was empty".into()));
+    }
+
+    let known = {
+        let config = state.config.read().await;
+        config
+            .catalog
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == name)
+            .cloned()
+    };
+    let Some(artifact) = known else {
+        // Storing a jar under a name nothing pins would leave bytes on disk
+        // that no build ever looks at.
+        return Err(ApiError::BadRequest(format!(
+            "{name} is not in the catalog, so nothing would ever use this file"
+        )));
+    };
+
+    let version = match query.version {
+        Some(version) if !version.trim().is_empty() => version.trim().to_string(),
+        // Reading it out of the jar is better than trusting a filename,
+        // which is how the old tooling got Multiverse wrong for months.
+        _ => crate::artifacts::jarmeta::read_plugin_meta(&body)
+            .map(|meta| meta.version)
+            .map_err(|e| {
+                ApiError::BadRequest(format!(
+                    "could not find a version in that jar ({e}), so pass one as ?version="
+                ))
+            })?,
+    };
+
+    let outcome = crate::artifacts::store_bytes(
+        state.store.as_ref(),
+        state.manifest.as_ref(),
+        &artifact,
+        &version,
+        &body,
+        "uploaded by hand",
+        None,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(json!({ "stored": outcome })))
 }

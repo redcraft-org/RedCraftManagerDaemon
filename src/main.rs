@@ -52,6 +52,12 @@ enum CliCommand {
         /// The directory to check. Defaults to the configured one.
         directory: Option<PathBuf>,
     },
+    /// Check that rcmd can reach everything it is configured to use.
+    ///
+    /// Read only. Worth running before you point it at a live fleet,
+    /// because the alternative is finding out that the bucket credentials
+    /// are wrong at the moment a server crashes and needs its template.
+    Doctor,
     /// Mint an API token and print it once.
     Token {
         /// What to call it, so you can tell your tokens apart later.
@@ -75,6 +81,7 @@ fn main() -> anyhow::Result<()> {
         CliCommand::Serve => serve(&cli.config),
         CliCommand::Init => init(&cli.config),
         CliCommand::Validate { directory } => validate(&cli.config, directory),
+        CliCommand::Doctor => doctor(&cli.config),
         CliCommand::Token { name, role } => mint_token(&cli.config, &name, &role),
     }
 }
@@ -170,6 +177,133 @@ fn mentions(directory: &std::path::Path, needle: &str) -> bool {
         }
     }
     false
+}
+
+fn doctor(config_path: &std::path::Path) -> anyhow::Result<()> {
+    let config = config::Config::load_or_default(config_path)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let mut problems = 0;
+
+        println!("Servers directory {}", config.servers_directory.display());
+        let servers: Vec<String> = match std::fs::read_dir(&config.servers_directory) {
+            Ok(read) => read
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(e) => {
+                println!("  cannot read it: {e}");
+                problems += 1;
+                vec![]
+            }
+        };
+        println!("  {} server(s): {}", servers.len(), servers.join(", "));
+
+        // tmux is how rcmd sees anything at all. If this is wrong nothing
+        // else matters, and the failure is silent and destructive.
+        let tmux = servers::tmux::Tmux::new(config.tmux_session_prefix.clone());
+        let mut alive = 0;
+        for name in &servers {
+            match tmux.session_exists(name).await {
+                Ok(true) => alive += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    println!("  tmux did not answer about {name}: {e}");
+                    problems += 1;
+                }
+            }
+        }
+        println!("  {alive} of them have a live tmux session");
+
+        match &config.template_source {
+            config::TemplateSource::None => println!("Templates: none configured"),
+            config::TemplateSource::LocalDir { path } => {
+                println!("Templates from {}", path.display());
+                for name in &servers {
+                    let tar = path.join(format!("{name}.tar"));
+                    match std::fs::metadata(&tar) {
+                        Ok(m) => println!("  {name}: {} bytes", m.len()),
+                        Err(_) => println!("  {name}: no template"),
+                    }
+                }
+            }
+            config::TemplateSource::S3 { bucket } => {
+                println!("Templates from s3://{}", bucket.bucket);
+                match s3::Bucket::connect(bucket).await {
+                    Err(e) => {
+                        println!("  cannot connect: {e}");
+                        problems += 1;
+                    }
+                    Ok(opened) => {
+                        for name in &servers {
+                            let key = s3::template_key(name);
+                            match opened.get(&key).await {
+                                Ok(bytes) => println!("  {name}: {} bytes", bytes.len()),
+                                Err(s3::S3Error::Missing { .. }) => {
+                                    println!("  {name}: no template in the bucket")
+                                }
+                                Err(e) => {
+                                    println!("  {name}: {e}");
+                                    problems += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        match &config.backup_destination {
+            config::BackupDestination::LocalDir { path } => {
+                println!("Backups to {}", path.display())
+            }
+            config::BackupDestination::S3 {
+                bucket,
+                key_template,
+                ..
+            } => {
+                println!("Backups to s3://{} as {key_template}", bucket.bucket);
+                match s3::Bucket::connect(bucket).await {
+                    Ok(_) => println!("  credentials accepted"),
+                    Err(e) => {
+                        println!("  cannot connect: {e}");
+                        problems += 1;
+                    }
+                }
+            }
+        }
+
+        match store::Database::connect(&config.database_url).await {
+            Ok(_) => println!("Database {} is reachable", config.database_url),
+            Err(e) => {
+                println!("Database {}: {e}", config.database_url);
+                problems += 1;
+            }
+        }
+
+        for (what, expression) in [
+            ("pipeline", &config.pipeline_schedule),
+            ("backup", &config.backup_schedule),
+            ("restart", &config.restart_schedule),
+        ] {
+            if expression.trim().is_empty() {
+                println!("No {what} schedule");
+            } else if let Err(e) = scheduler::Schedule::parse(expression) {
+                println!("The {what} schedule {expression:?} is not valid: {e}");
+                problems += 1;
+            } else {
+                println!("The {what} schedule {expression:?} parses");
+            }
+        }
+
+        if problems == 0 {
+            println!("\nNothing looks wrong.");
+            Ok(())
+        } else {
+            anyhow::bail!("{problems} problem(s)")
+        }
+    })
 }
 
 fn mint_token(config_path: &std::path::Path, name: &str, role: &str) -> anyhow::Result<()> {

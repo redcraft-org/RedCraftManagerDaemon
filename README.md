@@ -79,6 +79,8 @@ Each server also needs a `rcsm_config.json` in its own directory. If it's missin
 
 Every server gets a detached tmux session named after it. That means rcmd can be restarted, upgraded or crash without touching a single running server, and it will adopt whatever sessions it finds when it comes back. You can still `tmux attach -t rcsm_hub` and type in the console yourself.
 
+:warning: If you're replacing another supervisor, check its `KillMode` before you stop it. systemd's default is `control-group`, which signals every process in the unit's cgroup, and the tmux server usually ends up in there. Stopping the old daemon then kills every server it was supervising, whatever the daemon itself intended. `systemctl show <unit> -p KillMode` tells you, and a drop-in with `KillMode=process` plus a `daemon-reload` fixes it without signalling anything.
+
 Please notice that rcmd targets sessions exactly. tmux normally matches on prefixes, so a command aimed at `rcsm_crea` would land in `rcsm_crea_build_plot` if that's the only session starting with that name. That's a fun way to stop the wrong server, so rcmd doesn't do it.
 
 ### Your configuration lives in git

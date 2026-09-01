@@ -201,26 +201,6 @@ impl Tmux {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// Every session with our prefix, mapped back to server names. This is
-    /// what session adoption at boot reads.
-    #[allow(dead_code)] // used by the cutover session-adoption path (M9)
-    pub async fn list_sessions(&self) -> Result<Vec<String>, TmuxError> {
-        let out = Command::new(&self.binary)
-            .args(["ls", "-F", "#{session_name}"])
-            .output()
-            .await?;
-        // `tmux ls` exits non-zero when no server is running at all, which
-        // simply means no sessions.
-        if !out.status.success() {
-            return Ok(vec![]);
-        }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|s| s.strip_prefix(&self.prefix))
-            .map(str::to_string)
-            .collect())
-    }
-
     /// Polls until the session's existence matches `wanted` or the timeout
     /// passes. Returns whether the wanted state was reached.
     pub async fn wait_for_state(

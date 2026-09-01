@@ -286,6 +286,13 @@ impl Config {
         if let Ok(dir) = std::env::var("RCMD_CONFIG_DIRECTORY") {
             config.config_directory = PathBuf::from(dir);
         }
+        // A webhook url is a credential: anybody holding it can post into
+        // your channel. This lets it live in the environment file with the
+        // other secrets rather than in a config file people read over your
+        // shoulder.
+        if let Ok(url) = std::env::var("RCMD_DISCORD_WEBHOOK_URL") {
+            config.discord_webhook_url = Some(url);
+        }
         Ok(config)
     }
 }

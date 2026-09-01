@@ -169,7 +169,15 @@ pub fn spawn(
             return None;
         }
     };
-    tracing::info!("{:?} scheduled at {expression}", job);
+    // Schedules are matched in local time, and "local" on a server is
+    // whatever TZ happens to be set to. Saying which one out loud at
+    // startup is the cheapest way to catch the day somebody changes it and
+    // the nightly restart quietly moves by four hours.
+    tracing::info!(
+        "{:?} scheduled at {expression} ({})",
+        job,
+        chrono::Local::now().format("local time is currently %H:%M %Z")
+    );
 
     Some(tokio::spawn(async move {
         loop {

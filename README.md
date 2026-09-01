@@ -119,7 +119,9 @@ Then put it in `/etc/rcmd/env`:
 
 `RCMD_CONFIG_GITHUB_TOKEN=github_pat_...`
 
-:warning: Put it in `RCMD_CONFIG_GITHUB_TOKEN`, NOT in `GITHUB_TOKEN`. They're different on purpose. `GITHUB_TOKEN` is also sent to every repository your catalog fetches from, so a token scoped to just your config repository would be refused by all of them, and turning on pull requests would silently break every plugin download. `GITHUB_TOKEN` is optional and only exists to lift GitHub's rate limit when you're fetching a lot of releases; if you set both, use a token with public read for that one.
+:warning: Put it in `RCMD_CONFIG_GITHUB_TOKEN`, NOT in `GITHUB_TOKEN`. They're two variables on purpose. `GITHUB_TOKEN` is optional, it only lifts GitHub's rate limit on release lookups, and it gets sent to every repository your catalog fetches from, which are other people's. A token that can write to your config repository has no business being attached to requests going to sixty repositories that only need to be read. Keeping them apart means the write token only ever goes to the one place it can write.
+
+Please notice that a fine-grained token scoped to one repository can still read any public repository, so putting it in `GITHUB_TOKEN` wouldn't break anything today. It's about where the token travels, not about what it can do.
 
 Please notice that rcmd never edits anything under `.github/`, so the token doesn't need the Workflows permission. If you ever ask it to propose a change to a workflow file, GitHub will refuse the push and tell you exactly that.
 

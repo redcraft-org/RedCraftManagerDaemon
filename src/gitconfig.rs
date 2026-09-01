@@ -50,10 +50,9 @@ pub struct ConfigRepo {
     /// push over https. Without one the branch does not land at all.
     ///
     /// Deliberately its own token rather than the one the artifact
-    /// resolver uses. That one is sent to every repository a catalog entry
-    /// points at, and a token scoped to just the config repository would be
-    /// refused by all of them, so sharing one would mean turning on pull
-    /// requests silently broke plugin downloads.
+    /// resolver uses. That one is attached to requests going to every
+    /// repository a catalog entry points at, which are other people's, and
+    /// a token that can write here should not be travelling to those.
     github_token: Option<String>,
     /// Who the pin bump commits are from. A daemon cannot rely on whatever
     /// happens to be in somebody's global git config, and on a fresh box

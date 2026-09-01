@@ -373,9 +373,10 @@ fn mint_token(config_path: &std::path::Path, name: &str, role: &str) -> anyhow::
 /// scoped to that one repository. `GITHUB_TOKEN` is the fallback for the
 /// simple case where one classic token does everything.
 ///
-/// :warning: Do not put a narrowly scoped token in `GITHUB_TOKEN` alone.
-/// That one is also sent to every repository the catalog fetches from, and
-/// a token those repositories refuse turns every download into a failure.
+/// Separate from the resolver's token because they travel to different
+/// places. The resolver's goes to every repository the catalog fetches
+/// from, which are other people's, and a token that can write to the config
+/// repository should not be attached to those requests.
 fn config_repo_token() -> Option<String> {
     std::env::var("RCMD_CONFIG_GITHUB_TOKEN")
         .ok()

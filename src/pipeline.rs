@@ -258,12 +258,29 @@ impl Pipeline<'_> {
             }
         };
 
+        // A build with unfilled placeholders is not a build, it is a trap.
+        // The tar looks deployable and carries `password: 'MYSQL_PASSWORD'`
+        // and a forwarding secret that is the literal string
+        // VELOCITY_FORWARDING_SECRET, which is not a secret at all: anybody
+        // could use it to connect to a backend claiming to be anyone. So no
+        // tar gets written, and the caller is told exactly what to set.
         if !report.missing_secrets.is_empty() {
-            tracing::warn!(
-                "{name} was built with {} placeholder(s) left unfilled: {}",
-                report.missing_secrets.len(),
-                report.missing_secrets.join(", ")
-            );
+            let missing = report.missing_secrets.join(", ");
+            tracing::error!("refusing to pack {name}: nothing filled in {missing}");
+            return BuildOutcome {
+                template: name.to_string(),
+                succeeded: false,
+                tar: None,
+                tar_sha256: None,
+                error: Some(format!(
+                    "not packing {name}: no value for {missing}. Those are \
+                     placeholders the config files still contain, so the tar \
+                     would ship them literally. Set them in the environment \
+                     rcmd runs with."
+                )),
+                artifacts: report.artifacts,
+                missing_secrets: report.missing_secrets,
+            };
         }
 
         let tar_path = self.output.join(format!("{name}.tar"));
@@ -357,6 +374,58 @@ mod tests {
             "buildable: false\nartifacts:\n  CMI: '*'\n",
         );
         Templates::load(dir).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_template_with_an_unfilled_placeholder_produces_no_tar() {
+        // The failure this prevents: a tar that looks deployable and
+        // contains the literal string VELOCITY_FORWARDING_SECRET, which
+        // anybody could use to connect to a backend as anyone they like.
+        let dir = tempfile::tempdir().unwrap();
+        let write = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            dir.path().join("templates/proxy/template.yml"),
+            "artifacts: {}\nsecrets:\n  VELOCITY_FORWARDING_SECRET: FORWARDING\n",
+        );
+        write(
+            dir.path().join("templates/proxy/config/forwarding.secret"),
+            "VELOCITY_FORWARDING_SECRET",
+        );
+        let templates = Templates::load(dir.path()).unwrap();
+        let catalog = Catalog::default();
+        let manifest = crate::artifacts::store::tests_support::MemoryManifest::default();
+        let store = crate::artifacts::store::DirectoryStore::new(dir.path().join("store"));
+        let resolver = artifacts::sources::Resolver::new(None);
+        let output = dir.path().join("out");
+        let pipeline = Pipeline {
+            catalog: &catalog,
+            templates: &templates,
+            manifest: &manifest,
+            store: &store,
+            resolver: &resolver,
+            output: output.clone(),
+            workspace: dir.path().join("work"),
+            repo: None,
+        };
+
+        let outcome = pipeline.build_one("proxy").await;
+        assert!(
+            !outcome.succeeded,
+            "a build missing a secret must not succeed"
+        );
+        assert!(outcome.tar.is_none(), "and it must not leave a tar behind");
+        assert!(!output.join("proxy.tar").exists());
+        assert_eq!(
+            outcome.missing_secrets,
+            vec!["VELOCITY_FORWARDING_SECRET".to_string()]
+        );
+        assert!(outcome
+            .error
+            .unwrap()
+            .contains("VELOCITY_FORWARDING_SECRET"));
     }
 
     #[test]

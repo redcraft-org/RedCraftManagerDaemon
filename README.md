@@ -192,6 +192,16 @@ Which file is `log_files`, because `logs/latest.log` is a Minecraft convention a
 
 By default it looks for `logs/latest.log` then any `logs/*.log`, most recently written one first when several match. A map renderer that logs to the pane and nothing else just gets the pane, which is the right answer for it.
 
+### Secrets, and why a build can refuse
+
+A config file in the repository carries a placeholder like `MYSQL_PASSWORD` where the real value goes, and the template's `secrets` block says which environment variable holds it on the machine doing the build. That's what makes the config repository safe to make public.
+
+If a placeholder has no value, rcmd refuses to pack the template and tells you which ones are missing. It doesn't write a tar at all.
+
+:warning: :warning: :warning: That refusal is deliberate and you should not work around it. A template built without its secrets ships `password: 'MYSQL_PASSWORD'` literally, and a `forwarding.secret` containing the string `VELOCITY_FORWARDING_SECRET`, which is not a secret at all: anybody who guesses it can connect straight to a backend claiming to be whoever they like. A tar like that looks completely normal and DESTROYS the config of every server it touches.
+
+So if you're moving template building onto the box, move the secrets first.
+
 ### Plugins
 
 rcmd knows how to run servers. It doesn't know who's playing on them, and it shouldn't have to: that answer comes from a proxy, or a plugin on the proxy, or an endpoint somebody wrote, and every network does it differently.

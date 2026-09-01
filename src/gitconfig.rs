@@ -37,6 +37,11 @@ pub struct ConfigRepo {
     /// Used to open the pull request once the branch is pushed. Without
     /// one the branch still lands, somebody just has to click the button.
     github_token: Option<String>,
+    /// Who the pin bump commits are from. A daemon cannot rely on whatever
+    /// happens to be in somebody's global git config, and on a fresh box
+    /// there is nothing in it at all.
+    author_name: String,
+    author_email: String,
     client: reqwest::Client,
 }
 
@@ -57,6 +62,9 @@ impl ConfigRepo {
             root: root.into(),
             branch: branch.into(),
             github_token,
+            author_name: std::env::var("GIT_AUTHOR_NAME").unwrap_or_else(|_| "rcmd".into()),
+            author_email: std::env::var("GIT_AUTHOR_EMAIL")
+                .unwrap_or_else(|_| "rcmd@localhost".into()),
             client: reqwest::Client::new(),
         }
     }
@@ -240,6 +248,10 @@ impl ConfigRepo {
             .current_dir(&self.root)
             // A prompt for a password in a daemon is a hang, not a prompt.
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_AUTHOR_NAME", &self.author_name)
+            .env("GIT_AUTHOR_EMAIL", &self.author_email)
+            .env("GIT_COMMITTER_NAME", &self.author_name)
+            .env("GIT_COMMITTER_EMAIL", &self.author_email)
             .stdin(Stdio::null())
             .output()
             .await

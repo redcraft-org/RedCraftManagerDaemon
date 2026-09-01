@@ -44,6 +44,105 @@ pub struct Config {
 
     /// Database. SQLite file by default; a mysql:// URL is the power option.
     pub database_url: String,
+
+    /// Where the catalog and templates are read from. This is meant to be
+    /// a git checkout, so the whole configuration is reviewable.
+    pub config_directory: PathBuf,
+
+    /// Where fetched jars are kept.
+    pub artifact_directory: PathBuf,
+
+    /// Where built template tars are written. Point `template_source` at
+    /// the same place to have the servers pick them up.
+    pub build_directory: PathBuf,
+
+    /// Cron expression for the nightly refresh and rebuild. Empty disables
+    /// it, which is what you want when a CI job drives the pipeline
+    /// instead.
+    pub pipeline_schedule: String,
+
+    /// Servers nothing may restart, whoever asks. Keep the one server
+    /// somebody has spent a year setting up by hand in here.
+    pub frozen_servers: Vec<String>,
+
+    /// Servers that are not Minecraft. They still start and stop, they just
+    /// have no template and no players to warn.
+    pub non_minecraft_servers: Vec<String>,
+
+    /// Where to ask how many players are connected, so a restart can refuse
+    /// to drop them. Leave it unset and rcmd will not ask.
+    ///
+    /// Anything that answers with a bare number, or with JSON containing
+    /// `players.online` or `online`, works.
+    pub player_count_url: Option<String>,
+
+    /// What to send to a server before restarting it, and how long to wait
+    /// afterwards. `{minutes}` and `{reason}` are filled in.
+    ///
+    /// By default this is a plain `say`, because that works on every server
+    /// ever made. Please notice that if you run something that does its own
+    /// countdown and shutdown, point this at that instead.
+    pub warn_command: String,
+    pub warn_seconds: u64,
+
+    /// When pushes to public repositories are allowed. Unset means always.
+    pub push_window: Option<PushWindow>,
+
+    /// Discord webhook for pipeline results. Unset means no notifications.
+    pub discord_webhook_url: Option<String>,
+
+    /// The branch rcmd follows in the config repository, when the config
+    /// directory is a git checkout.
+    pub config_branch: String,
+}
+
+/// The hours during which pushing to a public repository is allowed.
+///
+/// This exists because a repository full of commits timestamped 03:00 on a
+/// Tuesday tells everybody watching that a robot is driving, and the point
+/// of reviewing a config repository is that a person is.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PushWindow {
+    /// Hours to add to UTC to get local time. Quebec is -4 in summer and
+    /// -5 in winter, and rcmd does not carry a timezone database to work
+    /// that out for you.
+    pub utc_offset_hours: i32,
+    /// The window opens at this hour, local.
+    pub from_hour: u32,
+    /// And closes at this one. Set it past midnight and it wraps.
+    pub to_hour: u32,
+    /// Weekends are outside the window when this is on.
+    pub weekdays_only: bool,
+}
+
+impl Default for PushWindow {
+    fn default() -> Self {
+        Self {
+            utc_offset_hours: -4,
+            from_hour: 17,
+            to_hour: 24,
+            weekdays_only: true,
+        }
+    }
+}
+
+impl PushWindow {
+    /// Whether the window is open at a given moment.
+    pub fn is_open_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::{Datelike, Timelike};
+        let local = now + chrono::Duration::hours(self.utc_offset_hours as i64);
+        if self.weekdays_only && local.weekday().number_from_monday() > 5 {
+            return false;
+        }
+        let hour = local.hour();
+        if self.from_hour <= self.to_hour {
+            hour >= self.from_hour && hour < self.to_hour
+        } else {
+            // A window that wraps past midnight, like 22 to 6.
+            hour >= self.from_hour || hour < self.to_hour
+        }
+    }
 }
 
 impl Default for Config {
@@ -60,6 +159,18 @@ impl Default for Config {
             },
             listen: "127.0.0.1:8484".into(),
             database_url: "sqlite:///var/lib/rcmd/rcmd.db".into(),
+            config_directory: PathBuf::from("/var/lib/rcmd/config"),
+            artifact_directory: PathBuf::from("/var/lib/rcmd/artifacts"),
+            build_directory: PathBuf::from("/var/lib/rcmd/builds"),
+            pipeline_schedule: "0 3 * * *".into(),
+            frozen_servers: vec![],
+            non_minecraft_servers: vec![],
+            player_count_url: None,
+            warn_command: "say Restarting in {minutes} minute(s): {reason}".into(),
+            warn_seconds: 0,
+            push_window: None,
+            discord_webhook_url: None,
+            config_branch: "main".into(),
         }
     }
 }
@@ -112,6 +223,9 @@ impl Config {
         }
         if let Ok(url) = std::env::var("RCMD_DATABASE_URL") {
             config.database_url = url;
+        }
+        if let Ok(dir) = std::env::var("RCMD_CONFIG_DIRECTORY") {
+            config.config_directory = PathBuf::from(dir);
         }
         Ok(config)
     }
@@ -175,5 +289,59 @@ impl ServerConfig {
             return Ok(default);
         }
         Self::read(server_dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn utc(day: u32, hour: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 9, day, hour, 0, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_push_window_opens_at_five_local_on_a_weekday() {
+        let window = PushWindow::default();
+        // 2026-09-01 is a Tuesday. 20:00 UTC is 16:00 in Quebec, still shut.
+        assert!(!window.is_open_at(utc(1, 20)));
+        // 21:00 UTC is 17:00 local, open.
+        assert!(window.is_open_at(utc(1, 21)));
+        // 2026-09-05 is a Saturday, so the hour does not matter.
+        assert!(!window.is_open_at(utc(5, 22)));
+    }
+
+    #[test]
+    fn a_window_may_wrap_past_midnight() {
+        let window = PushWindow {
+            from_hour: 22,
+            to_hour: 6,
+            weekdays_only: false,
+            utc_offset_hours: 0,
+        };
+        assert!(window.is_open_at(utc(1, 23)));
+        assert!(window.is_open_at(utc(1, 3)));
+        assert!(!window.is_open_at(utc(1, 12)));
+    }
+
+    #[test]
+    fn the_defaults_parse_from_an_empty_file() {
+        // Every key optional is the promise the config makes, and an empty
+        // file is the strongest test of it.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.tmux_session_prefix, "rcsm_");
+        assert_eq!(config.crash_max_tries, 3);
+        assert!(config.push_window.is_none());
+    }
+
+    #[test]
+    fn an_unknown_key_is_a_typo_and_says_so() {
+        // Silently ignoring frozen_server (no s) would mean a server you
+        // thought was protected is not.
+        let error = toml::from_str::<Config>("frozen_server = [\"hub\"]").unwrap_err();
+        assert!(error.to_string().contains("frozen_server"));
     }
 }

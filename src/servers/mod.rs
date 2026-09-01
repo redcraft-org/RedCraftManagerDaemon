@@ -123,6 +123,9 @@ pub struct Manager {
     crash_window: Duration,
     template_source: TemplateSource,
     backup_destination: BackupDestination,
+    /// What to send before a restart, with `{minutes}` and `{reason}`.
+    warn_command: String,
+    warn_seconds: u64,
 }
 
 impl Manager {
@@ -134,6 +137,8 @@ impl Manager {
             stop_timeout: Duration::from_secs(config.stop_timeout_secs),
             crash_max_tries: config.crash_max_tries,
             crash_window: Duration::from_secs(config.crash_window_secs),
+            warn_command: config.warn_command.clone(),
+            warn_seconds: config.warn_seconds,
             template_source: config.template_source.clone(),
             backup_destination: config.backup_destination.clone(),
         }
@@ -346,6 +351,51 @@ impl Manager {
             self.update_template(name, &entry.dir).await?;
         }
         self.start(name).await
+    }
+
+    /// Restarts, telling whoever is connected first.
+    ///
+    /// The warning is one console line and a wait, which is all rcmd needs
+    /// to know about it. Point `warn_command` at a plugin that runs its own
+    /// countdown and the wait is what gives that countdown room to happen.
+    ///
+    /// Returns the minutes actually warned for, so the caller can say so.
+    pub async fn restart_with_warning(
+        &self,
+        name: &str,
+        update_template: bool,
+        warn_minutes: Option<u64>,
+    ) -> Result<u64, ServerError> {
+        let seconds = match warn_minutes {
+            Some(minutes) => minutes.saturating_mul(60),
+            None => self.warn_seconds,
+        };
+        if seconds == 0 || self.warn_command.trim().is_empty() {
+            self.restart(name, update_template).await?;
+            return Ok(0);
+        }
+
+        // A warning nobody can receive is not worth waiting out.
+        if !self.tmux.session_exists(name).await? {
+            self.restart(name, update_template).await?;
+            return Ok(0);
+        }
+
+        let minutes = seconds.div_ceil(60);
+        let line = self
+            .warn_command
+            .replace("{minutes}", &minutes.to_string())
+            .replace("{seconds}", &seconds.to_string())
+            .replace("{reason}", "scheduled restart");
+        self.tmux.session_run_command(name, &line).await?;
+        tracing::info!("warned {name}, restarting in {seconds}s");
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+
+        // The warning command may well have stopped the server itself,
+        // which is exactly what RedCraft's does. Restart copes with that
+        // because stopping something already stopped is not an error here.
+        self.restart(name, update_template).await?;
+        Ok(minutes)
     }
 
     pub async fn run_command(&self, name: &str, command: &str) -> Result<(), ServerError> {

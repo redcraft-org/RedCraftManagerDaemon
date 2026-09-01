@@ -1,13 +1,23 @@
-//! rcmd — RedCraftManagerDaemon.
+//! rcmd, RedCraftManagerDaemon.
 //!
 //! One service that builds, ships and runs a Minecraft server fleet:
 //! plugin catalog, layered templates, deployment, process supervision, and
 //! the API/web/MCP surfaces over all of it.
 
 mod api;
+mod artifacts;
+mod auth;
+mod catalog;
 mod config;
 mod domain;
+mod gitconfig;
+mod notify;
+mod pipeline;
+mod policy;
+mod scheduler;
 mod servers;
+mod store;
+mod templates;
 mod web;
 
 use std::path::PathBuf;
@@ -32,6 +42,14 @@ enum CliCommand {
     Serve,
     /// Interactive first-run setup: writes config.toml.
     Init,
+    /// Mint an API token and print it once.
+    Token {
+        /// What to call it, so you can tell your tokens apart later.
+        name: String,
+        /// viewer, operator or admin.
+        #[arg(long, default_value = "admin")]
+        role: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -46,7 +64,24 @@ fn main() -> anyhow::Result<()> {
     match cli.command.unwrap_or(CliCommand::Serve) {
         CliCommand::Serve => serve(&cli.config),
         CliCommand::Init => init(&cli.config),
+        CliCommand::Token { name, role } => mint_token(&cli.config, &name, &role),
     }
+}
+
+fn mint_token(config_path: &std::path::Path, name: &str, role: &str) -> anyhow::Result<()> {
+    let config = config::Config::load_or_default(config_path)?;
+    let role = auth::Role::parse(role)
+        .ok_or_else(|| anyhow::anyhow!("{role:?} is not a role: viewer, operator or admin"))?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let database = store::Database::connect(&config.database_url).await?;
+        let (_, secret) = auth::Tokens::new(&database).create(name, role).await?;
+        // stdout, so it pipes. Everything else this binary says goes to the
+        // log, and you do not want your token in the journal.
+        println!("{secret}");
+        eprintln!("{role} token for {name:?}. Write it down, it is not stored.");
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -64,10 +99,89 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
 
         let _health = manager.spawn_healthcheck();
 
+        let database = Arc::new(store::Database::connect(&config.database_url).await?);
+        tracing::info!("database ready at {}", config.database_url);
+
+        // A fresh database has nobody in it, and a daemon nobody can log
+        // into is not useful. The first admin token is printed once, here,
+        // and that is the only time it exists in readable form.
+        let tokens = auth::Tokens::new(&database);
+        if !tokens.any_usable().await? {
+            let (_, secret) = tokens.create("first admin", auth::Role::Admin).await?;
+            tracing::warn!(
+                "no tokens existed, so here is an admin one. Copy it now, \
+                 it is not recoverable: {secret}"
+            );
+        }
+
+        // The config directory is a git checkout when somebody set one up,
+        // and just a directory otherwise. Both work; only the first can
+        // propose pin bumps or follow a remote.
+        let config_repo = {
+            let repo =
+                gitconfig::ConfigRepo::new(&config.config_directory, config.config_branch.clone());
+            if repo.is_checkout() {
+                match repo.sync().await {
+                    Ok(report) if report.changed => {
+                        tracing::info!(
+                            "config repository moved to {}",
+                            &report.after[..7.min(report.after.len())]
+                        )
+                    }
+                    Ok(_) => tracing::info!("config repository is up to date"),
+                    Err(e) => tracing::warn!("could not sync the config repository: {e}"),
+                }
+                Some(repo)
+            } else {
+                None
+            }
+        };
+
+        // A missing config directory is a first run, not a failure. The
+        // daemon still supervises servers with an empty catalog, which is
+        // exactly what you want while you are still writing the thing.
+        let (catalog, templates) = match pipeline::load_config(&config.config_directory) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                tracing::warn!(
+                    "no usable config in {}: {e}. Starting with an empty catalog.",
+                    config.config_directory.display()
+                );
+                (catalog::Catalog::default(), templates::Templates::default())
+            }
+        };
+        tracing::info!(
+            "{} artifacts and {} templates loaded",
+            catalog.artifacts.len(),
+            templates.by_name.len()
+        );
+
         let state = Arc::new(api::AppState {
             manager,
+            database: database.clone(),
             started_at: chrono::Utc::now(),
+            frozen_servers: config.frozen_servers.clone(),
+            non_minecraft_servers: config.non_minecraft_servers.clone(),
+            player_count_url: config.player_count_url.clone(),
+            push_window: config.push_window.clone(),
+            config: tokio::sync::RwLock::new(api::LoadedConfig { catalog, templates }),
+            manifest: database.clone(),
+            store: Arc::new(artifacts::store::DirectoryStore::new(
+                &config.artifact_directory,
+            )),
+            resolver: Arc::new(artifacts::sources::Resolver::new(
+                std::env::var("GITHUB_TOKEN").ok(),
+            )),
+            config_directory: config.config_directory.clone(),
+            build_directory: config.build_directory.clone(),
+            workspace: config.build_directory.join(".work"),
+            repo: config_repo,
+            notifier: notify::Notifier::new(config.discord_webhook_url.clone()),
+            pipeline_lock: tokio::sync::Mutex::new(()),
         });
+
+        let _scheduler = scheduler::spawn(state.clone(), &config.pipeline_schedule);
+
         let app = api::router(state);
 
         let listener = tokio::net::TcpListener::bind(&config.listen).await?;
@@ -113,6 +227,15 @@ crash_max_tries = 3
 crash_window_secs = 120
 listen = "127.0.0.1:8484"
 database_url = "sqlite:///var/lib/rcmd/rcmd.db"
+
+# Where the catalog and the templates are read from. Point this at a git
+# checkout and your whole configuration becomes reviewable.
+config_directory = "/var/lib/rcmd/config"
+artifact_directory = "/var/lib/rcmd/artifacts"
+build_directory = "/var/lib/rcmd/builds"
+
+# Nightly refresh and rebuild. Empty this to run the pipeline yourself.
+pipeline_schedule = "0 3 * * *"
 
 [template_source]
 kind = "none"

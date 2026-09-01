@@ -369,15 +369,15 @@ fn mint_token(config_path: &std::path::Path, name: &str, role: &str) -> anyhow::
 
 /// The token rcmd writes to the config repository with.
 ///
-/// `RCMD_CONFIG_TOKEN` first, so it can be a fine grained token scoped to
-/// that one repository. `GITHUB_TOKEN` is the fallback for the simple case
-/// where one classic token does everything.
+/// `RCMD_CONFIG_GITHUB_TOKEN` first, so it can be a fine grained token
+/// scoped to that one repository. `GITHUB_TOKEN` is the fallback for the
+/// simple case where one classic token does everything.
 ///
 /// :warning: Do not put a narrowly scoped token in `GITHUB_TOKEN` alone.
 /// That one is also sent to every repository the catalog fetches from, and
 /// a token those repositories refuse turns every download into a failure.
 fn config_repo_token() -> Option<String> {
-    std::env::var("RCMD_CONFIG_TOKEN")
+    std::env::var("RCMD_CONFIG_GITHUB_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
         .or_else(|| std::env::var("GITHUB_TOKEN").ok())

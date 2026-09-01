@@ -56,7 +56,11 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
     runtime.block_on(async move {
         let manager = Arc::new(servers::Manager::new(&config));
         let discovered = manager.discover().await?;
-        tracing::info!("supervising {} servers: {}", discovered.len(), discovered.join(", "));
+        tracing::info!(
+            "supervising {} servers: {}",
+            discovered.len(),
+            discovered.join(", ")
+        );
 
         let _health = manager.spawn_healthcheck();
 
@@ -80,7 +84,10 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
 
 fn init(config_path: &std::path::Path) -> anyhow::Result<()> {
     if config_path.exists() {
-        anyhow::bail!("{} already exists, refusing to overwrite", config_path.display());
+        anyhow::bail!(
+            "{} already exists, refusing to overwrite",
+            config_path.display()
+        );
     }
 
     // Minimal wizard for now: sensible defaults, the one question that has

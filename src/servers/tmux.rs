@@ -45,7 +45,9 @@ pub struct Tmux {
 
 impl Tmux {
     pub fn new(prefix: impl Into<String>) -> Self {
-        Self { prefix: prefix.into() }
+        Self {
+            prefix: prefix.into(),
+        }
     }
 
     pub fn session_name(&self, server: &str) -> String {
@@ -170,7 +172,15 @@ impl Tmux {
     pub async fn capture_pane(&self, server: &str, lines: u32) -> Result<String, TmuxError> {
         let start = format!("-{lines}");
         let out = Command::new("tmux")
-            .args(["capture-pane", "-t", &self.pane_target(server), "-p", "-J", "-S", &start])
+            .args([
+                "capture-pane",
+                "-t",
+                &self.pane_target(server),
+                "-p",
+                "-J",
+                "-S",
+                &start,
+            ])
             .output()
             .await?;
         if !out.status.success() {

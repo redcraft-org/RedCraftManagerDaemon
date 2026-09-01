@@ -89,7 +89,9 @@ impl CrashTracker {
         if self.tries > self.max_tries {
             CrashDecision::GiveUp
         } else {
-            CrashDecision::Revive { attempt: self.tries }
+            CrashDecision::Revive {
+                attempt: self.tries,
+            }
         }
     }
 
@@ -144,10 +146,7 @@ impl Manager {
     pub async fn discover(&self) -> anyhow::Result<Vec<String>> {
         let mut found = Vec::new();
         let read = std::fs::read_dir(&self.servers_directory).map_err(|e| {
-            anyhow::anyhow!(
-                "could not list {}: {e}",
-                self.servers_directory.display()
-            )
+            anyhow::anyhow!("could not list {}: {e}", self.servers_directory.display())
         })?;
 
         for entry in read.flatten() {
@@ -181,10 +180,7 @@ impl Manager {
                     dir,
                     lifecycle: Mutex::new(()),
                     state: RwLock::new(state),
-                    crashes: Mutex::new(CrashTracker::new(
-                        self.crash_max_tries,
-                        self.crash_window,
-                    )),
+                    crashes: Mutex::new(CrashTracker::new(self.crash_max_tries, self.crash_window)),
                 }),
             );
             found.push(name);
@@ -233,7 +229,11 @@ impl Manager {
     /// Applies the template for a server if a source is configured and a
     /// template exists. Not finding one is not an error: a server without a
     /// template is simply unmanaged disk state, which is the newbie default.
-    async fn update_template(&self, name: &str, dir: &std::path::Path) -> Result<bool, ServerError> {
+    async fn update_template(
+        &self,
+        name: &str,
+        dir: &std::path::Path,
+    ) -> Result<bool, ServerError> {
         match &self.template_source {
             TemplateSource::None => Ok(false),
             TemplateSource::LocalDir { path } => {
@@ -283,8 +283,8 @@ impl Manager {
             return Err(ServerError::AlreadyRunning(name.to_string()));
         }
 
-        let config = ServerConfig::read(&entry.dir)
-            .map_err(|e| ServerError::Config(e.to_string()))?;
+        let config =
+            ServerConfig::read(&entry.dir).map_err(|e| ServerError::Config(e.to_string()))?;
 
         *entry.state.write().await = ServerState::Starting;
         match self
@@ -312,8 +312,8 @@ impl Manager {
             *entry.state.write().await = ServerState::Stopped;
             return Err(ServerError::NotRunning(name.to_string()));
         }
-        let config = ServerConfig::read(&entry.dir)
-            .map_err(|e| ServerError::Config(e.to_string()))?;
+        let config =
+            ServerConfig::read(&entry.dir).map_err(|e| ServerError::Config(e.to_string()))?;
 
         // Marked before the stop command goes out: the healthcheck must not
         // read the session's death as a crash and revive what we are killing.
@@ -368,8 +368,8 @@ impl Manager {
 
     pub async fn backup(&self, name: &str) -> Result<backup::BackupReport, ServerError> {
         let entry = self.entry(name).await?;
-        let config = ServerConfig::read(&entry.dir)
-            .map_err(|e| ServerError::Config(e.to_string()))?;
+        let config =
+            ServerConfig::read(&entry.dir).map_err(|e| ServerError::Config(e.to_string()))?;
         let BackupDestination::LocalDir { path } = &self.backup_destination;
         let dir = entry.dir.clone();
         let dest = path.clone();
@@ -459,7 +459,10 @@ mod tests {
         // rcsm: max 3 tries inside a 120s window; the 4th is a bootloop.
         let mut tracker = CrashTracker::new(3, Duration::from_secs(120));
         let t0 = Instant::now();
-        assert_eq!(tracker.record_crash(t0), CrashDecision::Revive { attempt: 1 });
+        assert_eq!(
+            tracker.record_crash(t0),
+            CrashDecision::Revive { attempt: 1 }
+        );
         assert_eq!(
             tracker.record_crash(t0 + Duration::from_secs(10)),
             CrashDecision::Revive { attempt: 2 }
@@ -497,7 +500,10 @@ mod tests {
         let mut tracker = CrashTracker::new(3, Duration::from_secs(120));
         let t0 = Instant::now();
         // Each cycle: crash, then a revive that starts fine. No reset.
-        assert_eq!(tracker.record_crash(t0), CrashDecision::Revive { attempt: 1 });
+        assert_eq!(
+            tracker.record_crash(t0),
+            CrashDecision::Revive { attempt: 1 }
+        );
         assert_eq!(
             tracker.record_crash(t0 + Duration::from_secs(1)),
             CrashDecision::Revive { attempt: 2 }

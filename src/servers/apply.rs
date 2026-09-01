@@ -155,7 +155,9 @@ mod tests {
                     header.set_size(text.len() as u64);
                     header.set_mode(0o644);
                     header.set_cksum();
-                    builder.append_data(&mut header, name, text.as_bytes()).unwrap();
+                    builder
+                        .append_data(&mut header, name, text.as_bytes())
+                        .unwrap();
                 }
                 None => {
                     let mut header = tar::Header::new_gnu();
@@ -163,7 +165,9 @@ mod tests {
                     header.set_size(0);
                     header.set_mode(0o755);
                     header.set_cksum();
-                    builder.append_data(&mut header, name, std::io::empty()).unwrap();
+                    builder
+                        .append_data(&mut header, name, std::io::empty())
+                        .unwrap();
                 }
             }
         }
@@ -191,12 +195,21 @@ mod tests {
         let report = apply_tar_reader(&tar[..], root).unwrap();
 
         // The world survived untouched.
-        assert_eq!(std::fs::read(root.join("world/level.dat")).unwrap(), b"precious");
+        assert_eq!(
+            std::fs::read(root.join("world/level.dat")).unwrap(),
+            b"precious"
+        );
         // plugins/ was wiped wholesale: the data dir and the old jar are gone.
         assert!(!root.join("plugins/SomePlugin").exists());
         assert!(!root.join("plugins/Old.jar").exists());
-        assert_eq!(std::fs::read(root.join("plugins/New.jar")).unwrap(), b"new jar");
-        assert_eq!(std::fs::read(root.join("server.properties")).unwrap(), b"motd=hi");
+        assert_eq!(
+            std::fs::read(root.join("plugins/New.jar")).unwrap(),
+            b"new jar"
+        );
+        assert_eq!(
+            std::fs::read(root.join("server.properties")).unwrap(),
+            b"motd=hi"
+        );
         assert_eq!(report.files_written, 2);
     }
 
@@ -281,7 +294,10 @@ mod tests {
 
     #[test]
     fn dot_prefixed_names_normalize_like_rcst_produces_them() {
-        assert_eq!(safe_relative("./plugins/X.jar").unwrap(), PathBuf::from("plugins/X.jar"));
+        assert_eq!(
+            safe_relative("./plugins/X.jar").unwrap(),
+            PathBuf::from("plugins/X.jar")
+        );
         assert_eq!(safe_relative("./").unwrap(), PathBuf::new());
         assert_eq!(safe_relative(".").unwrap(), PathBuf::new());
     }

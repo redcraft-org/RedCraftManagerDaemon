@@ -109,7 +109,9 @@ async fn restart_server(
 ) -> Result<impl IntoResponse, ServerError> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
     state.manager.restart(&name, body.update_template).await?;
-    Ok(Json(json!({ "restarted": name, "update_template": body.update_template })))
+    Ok(Json(
+        json!({ "restarted": name, "update_template": body.update_template }),
+    ))
 }
 
 #[derive(Deserialize)]

@@ -167,7 +167,11 @@ impl ServerConfig {
         if !path.exists() {
             let default = Self::default_for_new_server();
             std::fs::write(&path, serde_json::to_string_pretty(&default)?)?;
-            tracing::info!("wrote default {} for {}", Self::FILE_NAME, server_dir.display());
+            tracing::info!(
+                "wrote default {} for {}",
+                Self::FILE_NAME,
+                server_dir.display()
+            );
             return Ok(default);
         }
         Self::read(server_dir)

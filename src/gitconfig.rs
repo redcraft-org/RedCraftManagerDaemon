@@ -34,6 +34,10 @@ pub struct ConfigRepo {
     root: PathBuf,
     /// The branch the daemon follows. Never committed to locally.
     branch: String,
+    /// Used to open the pull request once the branch is pushed. Without
+    /// one the branch still lands, somebody just has to click the button.
+    github_token: Option<String>,
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,10 +48,16 @@ pub struct SyncReport {
 }
 
 impl ConfigRepo {
-    pub fn new(root: impl Into<PathBuf>, branch: impl Into<String>) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        branch: impl Into<String>,
+        github_token: Option<String>,
+    ) -> Self {
         Self {
             root: root.into(),
             branch: branch.into(),
+            github_token,
+            client: reqwest::Client::new(),
         }
     }
 
@@ -128,6 +138,7 @@ impl ConfigRepo {
             body: body.to_string(),
             pushed: false,
             changed_files: vec![],
+            url: None,
         };
         if staged.trim().is_empty() {
             // The pin is already what we wanted to set it to.
@@ -154,13 +165,67 @@ impl ConfigRepo {
         let changed_files = staged.lines().map(|line| line.to_string()).collect();
         self.git(&["checkout", &self.branch]).await.ok();
 
+        let url = self.open_pull_request(&branch, &title, body).await;
         Ok(Proposal {
             branch,
             title,
             body: body.to_string(),
             pushed: true,
             changed_files,
+            url,
         })
+    }
+
+    /// Opens the pull request, or says nothing if it cannot.
+    ///
+    /// A branch nobody can see is not much of a proposal, but failing the
+    /// whole run because GitHub was slow would be worse. The branch is
+    /// pushed either way and the log says what happened.
+    async fn open_pull_request(&self, branch: &str, title: &str, body: &str) -> Option<String> {
+        let token = self.github_token.as_deref()?;
+        let remote = self.git(&["remote", "get-url", "origin"]).await.ok()?;
+        let slug = github_slug(remote.trim())?;
+
+        let response = self
+            .client
+            .post(format!("https://api.github.com/repos/{slug}/pulls"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "rcmd")
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&serde_json::json!({
+                "title": title,
+                "body": body,
+                "head": branch,
+                "base": self.branch,
+            }))
+            .send()
+            .await
+            .ok()?;
+
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.ok()?;
+        if status.is_success() {
+            return payload
+                .get("html_url")
+                .and_then(|url| url.as_str())
+                .map(str::to_string);
+        }
+
+        // A pull request already open for this branch is the normal case on
+        // a rerun, not a failure.
+        let message = payload
+            .get("errors")
+            .and_then(|errors| errors.get(0))
+            .and_then(|first| first.get("message"))
+            .and_then(|message| message.as_str())
+            .unwrap_or("");
+        if message.contains("already exists") {
+            tracing::info!("{branch} already has a pull request open");
+        } else {
+            tracing::warn!("could not open a pull request for {branch}: {status} {payload}");
+        }
+        None
     }
 
     async fn remote_branch_exists(&self, branch: &str) -> bool {
@@ -204,6 +269,21 @@ pub struct Proposal {
     /// False when the bump turned out to change nothing.
     pub pushed: bool,
     pub changed_files: Vec<String>,
+    /// The pull request, when rcmd had a token to open one with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// `git@github.com:owner/repo.git` or the https form gives `owner/repo`.
+fn github_slug(remote: &str) -> Option<String> {
+    let rest = remote
+        .split_once("github.com")
+        .map(|(_, rest)| rest.trim_start_matches([':', '/']))?;
+    let rest = rest.trim_end_matches(".git").trim_end_matches('/');
+    let mut parts = rest.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
 /// One branch per artifact and version, so a rerun replaces itself.
@@ -312,6 +392,19 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_reduces_to_a_slug_whichever_way_it_is_written() {
+        assert_eq!(
+            github_slug("git@github.com:redcraft-org/rcmd_config.git").as_deref(),
+            Some("redcraft-org/rcmd_config")
+        );
+        assert_eq!(
+            github_slug("https://github.com/redcraft-org/rcmd_config").as_deref(),
+            Some("redcraft-org/rcmd_config")
+        );
+        assert_eq!(github_slug("git@gitlab.com:someone/thing.git"), None);
+    }
+
+    #[test]
     fn the_body_says_what_merging_does_and_does_not_do() {
         let body = proposal_body("CMI", "9.7.*", "9.8.*", "9.8.1");
         assert!(body.contains("9.7.*"));
@@ -322,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn a_directory_that_is_not_a_checkout_says_so_rather_than_guessing() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = ConfigRepo::new(dir.path(), "main");
+        let repo = ConfigRepo::new(dir.path(), "main", None);
         assert!(!repo.is_checkout());
         assert!(matches!(repo.sync().await, Err(GitError::NotACheckout(_))));
     }
@@ -333,7 +426,7 @@ mod tests {
             // No git on this machine. Not a reason to fail the suite.
             return;
         };
-        let repo = ConfigRepo::new(remote.checkout, "main");
+        let repo = ConfigRepo::new(remote.checkout, "main", None);
         let mut edits = BTreeMap::new();
         edits.insert(
             PathBuf::from("templates/hub/template.yml"),

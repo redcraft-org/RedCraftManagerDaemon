@@ -74,6 +74,8 @@ pub enum SourceKind {
     /// The Fabric meta API, which needs a loader version and an installer
     /// version put together before there is a URL to fetch.
     Fabricmc,
+    /// Hangar, PaperMC's plugin site.
+    Hangar,
     /// Nothing to fetch: somebody uploads this one.
     ///
     /// A handful of plugins sit behind a login and a bot check. Pretending
@@ -102,6 +104,14 @@ pub enum PostProcessor {
     FabricInstaller,
     /// Pulls a single file out of a zip before the rest of the chain runs.
     Unzip,
+    /// Takes the version from whatever the source called the release.
+    ///
+    /// For the handful of things that ship no version anywhere inside the
+    /// file. A GitHub tag or a PaperMC build is not as good as reading it
+    /// out of the jar, but it beats parsing a file name, which is how the
+    /// old tooling decided a plugin called Multiverse-Core was at version
+    /// "Core" for several months.
+    FromSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

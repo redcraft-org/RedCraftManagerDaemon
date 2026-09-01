@@ -65,7 +65,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// The chain is ordered: an unzip has to happen before whatever reads the
 /// jar inside it.
-pub fn process(artifact: &Artifact, mut bytes: Vec<u8>) -> Result<(Vec<u8>, JarMeta), FetchError> {
+pub fn process(
+    artifact: &Artifact,
+    mut bytes: Vec<u8>,
+    upstream_id: Option<&str>,
+) -> Result<(Vec<u8>, JarMeta), FetchError> {
     let mut meta: Option<JarMeta> = None;
 
     for processor in &artifact.post_processors {
@@ -80,6 +84,19 @@ pub fn process(artifact: &Artifact, mut bytes: Vec<u8>) -> Result<(Vec<u8>, JarM
             PostProcessor::FabricInstaller => {
                 meta = Some(jarmeta::read_installer_properties(&bytes)?)
             }
+            PostProcessor::FromSource => {
+                let version = upstream_id.map(strip_v).ok_or_else(|| {
+                    FetchError::NoVersion(format!(
+                        "{} takes its version from the source, and the source did not give one",
+                        artifact.name
+                    ))
+                })?;
+                meta = Some(JarMeta {
+                    name: None,
+                    version,
+                    source_file: "the source",
+                });
+            }
         }
     }
 
@@ -90,6 +107,14 @@ pub fn process(artifact: &Artifact, mut bytes: Vec<u8>) -> Result<(Vec<u8>, JarM
         ))
     })?;
     Ok((bytes, meta))
+}
+
+/// GitHub tags are usually `v1.2.3`, and the v is not part of the version.
+fn strip_v(tag: &str) -> String {
+    match tag.strip_prefix('v') {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest.to_string(),
+        _ => tag.to_string(),
+    }
 }
 
 /// Fetches one artifact if it is not already stored.
@@ -124,7 +149,7 @@ pub async fn fetch_one(
         Err(e) => return FetchOutcome::failed(&artifact.name, e),
     };
 
-    let (bytes, meta) = match process(artifact, bytes) {
+    let (bytes, meta) = match process(artifact, bytes, release.upstream_id.as_deref()) {
         Ok(pair) => pair,
         Err(e) => return FetchOutcome::failed(&artifact.name, e),
     };
@@ -219,6 +244,24 @@ mod tests {
             post_processors: vec![],
             enabled: true,
         }
+    }
+
+    #[test]
+    fn a_version_can_come_from_the_source_when_the_file_has_none() {
+        // BlueMap and Velocity ship no version inside the file, and the old
+        // tooling read one out of the file name. That is how a plugin
+        // called Multiverse-Core spent months at version "Core".
+        let mut artifact = uploadable();
+        artifact.post_processors = vec![PostProcessor::FromSource];
+        let (_, meta) = process(&artifact, b"not even a jar".to_vec(), Some("v5.11")).unwrap();
+        assert_eq!(meta.version, "5.11");
+
+        // A leading v is only dropped when it is a tag prefix.
+        let (_, meta) = process(&artifact, vec![], Some("velocity-4")).unwrap();
+        assert_eq!(meta.version, "velocity-4");
+
+        // And a source that says nothing is an error, not an empty version.
+        assert!(process(&artifact, vec![], None).is_err());
     }
 
     #[tokio::test]
@@ -333,7 +376,7 @@ mod tests {
             vec![PostProcessor::Unzip, PostProcessor::Plugin],
             Some("Citizens-*.jar"),
         );
-        let (bytes, meta) = process(&artifact, outer).unwrap();
+        let (bytes, meta) = process(&artifact, outer, None).unwrap();
         assert_eq!(meta.version, "2.0.35");
         // The stored bytes are the inner jar, not the wrapper.
         assert_eq!(bytes, inner);
@@ -342,7 +385,7 @@ mod tests {
     #[test]
     fn an_entry_with_no_version_reader_is_an_error_not_a_guess() {
         let artifact = artifact(vec![], None);
-        let err = process(&artifact, jar(&[("a", "b")])).unwrap_err();
+        let err = process(&artifact, jar(&[("a", "b")]), None).unwrap_err();
         assert!(matches!(err, FetchError::NoVersion(_)));
     }
 

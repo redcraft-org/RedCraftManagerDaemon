@@ -221,8 +221,11 @@ fn serve(config_path: &std::path::Path) -> anyhow::Result<()> {
         // and just a directory otherwise. Both work; only the first can
         // propose pin bumps or follow a remote.
         let config_repo = {
-            let repo =
-                gitconfig::ConfigRepo::new(&config.config_directory, config.config_branch.clone());
+            let repo = gitconfig::ConfigRepo::new(
+                &config.config_directory,
+                config.config_branch.clone(),
+                std::env::var("GITHUB_TOKEN").ok(),
+            );
             if repo.is_checkout() {
                 match repo.sync().await {
                     Ok(report) if report.changed => {

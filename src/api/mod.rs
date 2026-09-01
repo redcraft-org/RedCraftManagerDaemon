@@ -27,6 +27,10 @@ use crate::servers::{Manager, ServerError};
 use crate::store::Database;
 use crate::templates::Templates;
 
+/// How big an uploaded jar may be. Geyser is around sixty megabytes and
+/// nothing sensible is anywhere near this.
+const MAX_UPLOAD_BYTES: usize = 512 * 1024 * 1024;
+
 pub struct AppState {
     pub manager: Arc<Manager>,
     pub database: Arc<Database>,
@@ -274,7 +278,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/artifacts", get(list_artifacts))
         .route(
             "/api/v1/artifacts/{name}/versions",
-            get(artifact_versions).post(upload_version),
+            get(artifact_versions)
+                .post(upload_version)
+                // curl -T is a PUT, and that is how everybody sends a file.
+                .put(upload_version)
+                // A jar is bigger than the two megabytes axum allows by
+                // default. FastAsyncWorldEdit alone is thirty.
+                .layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
         .route("/api/v1/templates", get(list_templates))
         .route("/api/v1/templates/{name}/build", post(build_template))

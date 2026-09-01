@@ -69,6 +69,7 @@ impl Resolver {
             SourceKind::Papermc => self.papermc(artifact).await,
             SourceKind::Spiget => self.spiget(artifact).await,
             SourceKind::Fabricmc => self.fabricmc(artifact).await,
+            SourceKind::Hangar => self.hangar(artifact).await,
             SourceKind::Manual => Err(SourceError::NoMatch {
                 from: "manual",
                 filter: artifact.name.clone(),
@@ -274,12 +275,21 @@ impl Resolver {
         let api = format!("{base}/builds/latest");
         let build: PmBuild = self.get_json("papermc", &api).await?;
 
+        // The build number on its own is not something anybody can pin
+        // against, so the version segment of the url goes in front of it.
+        let version = base.rsplit('/').next().unwrap_or("");
+        let identity = match build.id {
+            Some(id) if !version.is_empty() => Some(format!("{version}-{id}")),
+            Some(id) => Some(id.to_string()),
+            None => (!version.is_empty()).then(|| version.to_string()),
+        };
+
         let filter = artifact.file_filter.as_deref().unwrap_or("*");
         for download in build.downloads.values() {
             if crate::catalog::pin_matches(filter, &download.name) {
                 return Ok(Release {
                     url: download.url.clone(),
-                    upstream_id: build.id.map(|n| n.to_string()),
+                    upstream_id: identity,
                 });
             }
         }
@@ -308,6 +318,75 @@ impl Resolver {
         Ok(Release {
             url: format!("https://api.spiget.org/v2/resources/{id}/download"),
             upstream_id: version.name.or_else(|| version.id.map(|i| i.to_string())),
+        })
+    }
+
+    /// Hangar, PaperMC's plugin site.
+    ///
+    /// The catalog url is the project page, so
+    /// https://hangar.papermc.io/DenizenScript/Denizen.
+    async fn hangar(&self, artifact: &Artifact) -> Result<Release, SourceError> {
+        #[derive(Deserialize)]
+        struct HgFile {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        struct HgDownload {
+            #[serde(rename = "fileInfo")]
+            file_info: Option<HgFile>,
+            #[serde(rename = "downloadUrl")]
+            download_url: Option<String>,
+            #[serde(rename = "externalUrl")]
+            external_url: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct HgVersion {
+            name: String,
+            #[serde(default)]
+            downloads: std::collections::BTreeMap<String, HgDownload>,
+        }
+        #[derive(Deserialize)]
+        struct HgVersions {
+            result: Vec<HgVersion>,
+        }
+
+        let slug = hangar_slug(&artifact.url).ok_or_else(|| {
+            SourceError::Unsupported(format!("{:?} is not a hangar project url", artifact.url))
+        })?;
+        let api = format!("https://hangar.papermc.io/api/v1/projects/{slug}/versions?limit=10");
+        let versions: HgVersions = self.get_json("hangar", &api).await?;
+
+        let filter = artifact.file_filter.as_deref().unwrap_or("*");
+        for version in &versions.result {
+            for (platform, download) in &version.downloads {
+                let name = download
+                    .file_info
+                    .as_ref()
+                    .map(|info| info.name.as_str())
+                    .unwrap_or(platform.as_str());
+                if !crate::catalog::pin_matches(filter, name) {
+                    continue;
+                }
+                // Hangar either hosts the file or points somewhere else.
+                let url = download
+                    .download_url
+                    .clone()
+                    .or_else(|| download.external_url.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "https://hangar.papermc.io/api/v1/projects/{slug}/versions/{}/{platform}/download",
+                            version.name
+                        )
+                    });
+                return Ok(Release {
+                    url,
+                    upstream_id: Some(version.name.clone()),
+                });
+            }
+        }
+        Err(SourceError::NoMatch {
+            from: "hangar",
+            filter: filter.into(),
         })
     }
 
@@ -381,6 +460,18 @@ fn modrinth_slug(url: &str) -> Option<String> {
 /// `https://www.spigotmc.org/resources/plotsquared.77506/`.
 /// The Fabric meta API's installer listing.
 const FABRIC_INSTALLERS: &str = "https://meta.fabricmc.net/v2/versions/installer";
+
+/// `https://hangar.papermc.io/Owner/Project` gives `Owner/Project`.
+fn hangar_slug(url: &str) -> Option<String> {
+    let rest = url.split("hangar.papermc.io/").nth(1)?;
+    let mut parts = rest.trim_start_matches('/').split('/');
+    let owner = parts.next()?;
+    let project = parts.next()?;
+    if owner.is_empty() || project.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{project}"))
+}
 
 fn spiget_id(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');

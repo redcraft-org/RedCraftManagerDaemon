@@ -24,7 +24,7 @@ regex = "1"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 rust-embed = { version = "8.12.0", features = ["axum"] }
-zip = "8.6.0"
+zip = "9.0.5"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2", "charset"] }
 async-trait = "0.1.92"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "any", "sqlite", "mysql", "chrono"] }

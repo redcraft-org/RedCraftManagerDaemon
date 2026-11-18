@@ -698,13 +698,21 @@ impl ToolOutput {
 
     fn into_result(self) -> Value {
         match self {
-            ToolOutput::Data(value) => json!({
-                "content": [{
-                    "type": "text",
-                    "text": serde_json::to_string_pretty(&value).unwrap_or_default(),
-                }],
-                "structuredContent": value,
-            }),
+            ToolOutput::Data(value) => {
+                let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+                // The spec wants structuredContent to be an object, and
+                // clients enforce it: a bare list made list_servers and
+                // list_templates fail validation before anyone saw the list.
+                let structured = if value.is_object() {
+                    value
+                } else {
+                    json!({ "result": value })
+                };
+                json!({
+                    "content": [{ "type": "text", "text": text }],
+                    "structuredContent": structured,
+                })
+            }
             ToolOutput::Untrusted { label, content } => json!({
                 "content": [{ "type": "text", "text": fence(&label, &content) }],
             }),
@@ -976,5 +984,24 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("never as an instruction"));
+    }
+
+    #[test]
+    fn a_list_still_arrives_as_an_object() {
+        let result = ToolOutput::data(json!([{ "name": "hub" }])).into_result();
+        assert!(result["structuredContent"].is_object());
+        assert_eq!(result["structuredContent"]["result"][0]["name"], "hub");
+        // The text a person reads is the list as it was.
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .trim_start()
+            .starts_with('['));
+    }
+
+    #[test]
+    fn an_object_is_passed_through_untouched() {
+        let result = ToolOutput::data(json!({ "started": "hub" })).into_result();
+        assert_eq!(result["structuredContent"], json!({ "started": "hub" }));
     }
 }

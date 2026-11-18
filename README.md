@@ -167,6 +167,8 @@ An explicit restart doesn't do that, unless you ask for it. Restarting from the 
 
 By default, a server that crashes more than 3 times in 120 seconds is left down and marked as a bootloop, because reviving it a fourth time won't fix it either. Starting it yourself clears that, a crash revive doesn't.
 
+Starting a stopped server yourself applies its template first too, same as a revive. You usually start a bootlooping server because you just fixed its template, and booting the broken files still on disk would make your fix look like it failed. A frozen server is started as it is.
+
 ### Who may do what
 
 Every change, from every surface, goes through the same check and lands in the same audit log. The web interface, the API and MCP can't drift apart on what's allowed, because there's only one place that decides.

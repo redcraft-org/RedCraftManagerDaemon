@@ -391,7 +391,33 @@ impl Manager {
     /// Operator-initiated start. Clears the crash history, because a human
     /// deciding to start a server is the signal that whatever was wrong has
     /// been dealt with; that is also the only way out of a bootloop.
+    ///
+    /// It refreshes the template first, like a revive does. The usual reason
+    /// a person starts a crashed server is that they just fixed its
+    /// template, and booting the stale files on disk instead made the fix
+    /// look like it had failed.
     pub async fn start(&self, name: &str) -> Result<(), ServerError> {
+        self.start_with(name, true).await
+    }
+
+    async fn start_with(&self, name: &str, update_template: bool) -> Result<(), ServerError> {
+        if update_template && !self.frozen.iter().any(|f| f == name) {
+            let entry = self.entry(name).await?;
+            let _guard = entry.lifecycle.lock().await;
+            // Applying a template rewrites whole directories, so it never
+            // happens under a live session. start_inner says so properly.
+            if !self.tmux.session_exists(name).await? {
+                if let Err(e) = self.update_template(name, &entry.dir).await {
+                    tracing::warn!("template refresh before starting {name} failed: {e}");
+                    self.tell(
+                        crate::notify::Level::Warn,
+                        name,
+                        &format!("Could not refresh the template before starting: {e}"),
+                    )
+                    .await;
+                }
+            }
+        }
         let result = self.start_inner(name).await;
         if result.is_ok() {
             self.entry(name).await?.crashes.lock().await.reset();
@@ -490,7 +516,9 @@ impl Manager {
             let _guard = entry.lifecycle.lock().await;
             self.update_template(name, &entry.dir).await?;
         }
-        self.start(name).await
+        // Already refreshed just above when asked to, and a restart that
+        // was told not to touch the template must not do it anyway.
+        self.start_with(name, false).await
     }
 
     /// Restarts, telling whoever is connected first.
@@ -562,7 +590,9 @@ impl Manager {
                 }
                 Ok(false) => {}
             }
-            match self.start(&name).await {
+            // Discovery applied the template to every stopped server a
+            // moment ago, so a second download of each tar buys nothing.
+            match self.start_with(&name, false).await {
                 Ok(()) => report.restarted.push(name),
                 Err(e) => {
                     tracing::error!("could not start {name}: {e}");
@@ -964,6 +994,97 @@ mod tests {
         // The jar is still there, and nothing from the template arrived.
         assert!(server.join("plugins/Keep.jar").exists());
         assert!(!server.join("plugins/Other.jar").exists());
+    }
+
+    /// A stand-in for tmux that remembers one session in a marker file, so
+    /// starts go through without a real session. `alive` starts it running.
+    fn fake_tmux(dir: &std::path::Path, alive: bool) -> Tmux {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("tmux");
+        let marker = dir.join("tmux-session");
+        if alive {
+            std::fs::write(&marker, b"").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&marker);
+        }
+        let marker = marker.display();
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  has-session) [ -e '{marker}' ] ;;\n  new) touch '{marker}' ;;\n  *) exit 0 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Tmux::with_binary(path.to_string_lossy().into_owned(), "rcmdtest_".into())
+    }
+
+    fn write_template(templates: &std::path::Path, server: &str, file: &str) {
+        std::fs::create_dir_all(templates).unwrap();
+        let out = std::fs::File::create(templates.join(format!("{server}.tar"))).unwrap();
+        let mut builder = tar::Builder::new(out);
+        let mut header = tar::Header::new_gnu();
+        let body = b"fresh";
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(&mut header, file, &body[..]).unwrap();
+        builder.finish().unwrap();
+    }
+
+    /// Discovers with no template in place, then publishes one, which is
+    /// the shape of "the server crashed, I fixed its template, start it".
+    async fn manager_after_a_template_fix(
+        dir: &std::path::Path,
+        frozen: Vec<&str>,
+        alive: bool,
+    ) -> Manager {
+        std::fs::create_dir_all(dir.join("survival_vanilla/mods")).unwrap();
+        let templates = dir.join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        let mut config = config_with(frozen, dir);
+        config.template_source = TemplateSource::LocalDir {
+            path: templates.clone(),
+        };
+        let mut manager = Manager::new(&config);
+        manager.tmux = fake_tmux(dir, false);
+        manager.discover().await.unwrap();
+        write_template(&templates, "survival_vanilla", "mods/Fixed.jar");
+        manager.tmux = fake_tmux(dir, alive);
+        manager
+    }
+
+    #[tokio::test]
+    async fn starting_a_server_by_hand_applies_its_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_after_a_template_fix(dir.path(), vec![], false).await;
+
+        manager.start("survival_vanilla").await.unwrap();
+
+        assert!(dir.path().join("survival_vanilla/mods/Fixed.jar").exists());
+    }
+
+    #[tokio::test]
+    async fn starting_a_frozen_server_leaves_its_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            manager_after_a_template_fix(dir.path(), vec!["survival_vanilla"], false).await;
+
+        manager.start("survival_vanilla").await.unwrap();
+
+        assert!(!dir.path().join("survival_vanilla/mods/Fixed.jar").exists());
+    }
+
+    #[tokio::test]
+    async fn starting_a_running_server_never_applies_a_template_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager_after_a_template_fix(dir.path(), vec![], true).await;
+
+        let result = manager.start("survival_vanilla").await;
+
+        assert!(matches!(result, Err(ServerError::AlreadyRunning(_))));
+        assert!(!dir.path().join("survival_vanilla/mods/Fixed.jar").exists());
     }
 
     #[tokio::test]
